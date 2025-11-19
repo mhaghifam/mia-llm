@@ -1,0 +1,12 @@
+numpy
+scipy
+tqdm
+docopt
+nltk
+sentencepiece
+lxml
+sacrebleu
+tensorboard
+transformers
+datasets
+peft
