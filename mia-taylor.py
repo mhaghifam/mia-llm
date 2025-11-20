@@ -502,9 +502,16 @@ def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
 
     print(f"\n[Your MIA] Loading PT and FT models")
     pt_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.pt_dir)
-    ft_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.ft_dir)
     pt_model.to(device)
+    for name, p in pt_model.named_parameters():
+        if "lora_" in name.lower() or "classifier" in name.lower():
+            p.requires_grad_(True)
+
+    ft_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.ft_dir)
     ft_model.to(device)
+    for name, p in ft_model.named_parameters():
+        if "lora_" in name.lower() or "classifier" in name.lower():
+            p.requires_grad_(True)
 
     # delta_theta (FT - PT) over trainable params, flattened
     pt_named = get_trainable_named_params(pt_model)
