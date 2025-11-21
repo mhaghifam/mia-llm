@@ -31,7 +31,7 @@ class Config:
     task_name: str = "sst2"
     max_length: int = 128
     batch_size: int = 32
-    num_epochs: int = 3
+    num_epochs: int = 1
     lr: float = 2e-4
     weight_decay: float = 0.01
     lora_r: int = 8
@@ -49,9 +49,9 @@ class Config:
     lambda_prox: float = 1e-4
 
     # curvature regularization for your attack: lam * I in (sum phi phi^T + lam I)
-    lambda_curv: float = 1e-2
-    cg_tol: float = 1e-4
-    cg_maxit: int = 200
+    lambda_curv: float = 1e-4
+    cg_tol: float = 1e-3
+    cg_maxit: int = 100
 
     # where to save models
     pt_dir: str = "./roberta_lora_sst2_pt"
@@ -364,10 +364,13 @@ def compute_phi_matrix_for_dataset(model, dataset, device):
       Phi:   tensor of shape (m, d) where m = len(dataset), d = #params
     """
     model.eval()
+
+    # Only trainable params (we already set requires_grad_ True for LoRA + classifier)
     named_params = get_trainable_named_params(model)
     params = [p for _, p in named_params]
     names = [n for n, _ in named_params]
 
+    # Ensure they require grad
     for p in params:
         p.requires_grad_(True)
 
@@ -392,8 +395,18 @@ def compute_phi_matrix_for_dataset(model, dataset, device):
             params,
             retain_graph=False,
             create_graph=False,
+            allow_unused=True,   # <-- important
         )
-        g_flat = torch.cat([g.reshape(-1) for g in grads]).detach()
+
+        # Replace any None with zeros (param not used in this forward)
+        safe_grads = []
+        for g, p in zip(grads, params):
+            if g is None:
+                safe_grads.append(torch.zeros_like(p))
+            else:
+                safe_grads.append(g)
+
+        g_flat = torch.cat([g.reshape(-1) for g in safe_grads]).detach()
         phi_list.append(g_flat.cpu())
 
     Phi = torch.stack(phi_list, dim=0)  # (m, d)
@@ -406,9 +419,10 @@ def compute_phi_for_example(model, batch, device, param_names_ref):
     in the same order as param_names_ref.
     """
     model.eval()
+
+    # Map name -> param and pick them in a fixed order
     named_params = get_trainable_named_params(model)
     name_to_param = {n: p for n, p in named_params}
-
     params = [name_to_param[n] for n in param_names_ref]
 
     for p in params:
@@ -431,8 +445,17 @@ def compute_phi_for_example(model, batch, device, param_names_ref):
         params,
         retain_graph=False,
         create_graph=False,
+        allow_unused=True,   # <-- important
     )
-    g_flat = torch.cat([g.reshape(-1) for g in grads]).detach()
+
+    safe_grads = []
+    for g, p in zip(grads, params):
+        if g is None:
+            safe_grads.append(torch.zeros_like(p))
+        else:
+            safe_grads.append(g)
+
+    g_flat = torch.cat([g.reshape(-1) for g in safe_grads]).detach()
     return g_flat
 
 
@@ -487,31 +510,25 @@ def apply_Hinv_t_matrix_free(Phi, t, lam, tol=1e-6, maxit=200):
 
 
 def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
-    """
-    Your curvature-based MIA:
-
-    - Build curvature from AUX: H = sum phi_i phi_i^T + lam I
-    - For each candidate (x,y):
-        phi = ∇_theta log p_PT(y|x)
-        u = H^{-1} phi
-        denom = 1 + phi^T u
-        Delta = u / denom
-        score = <Delta, delta_theta>
-    """
     assert ds_aux is not None and len(ds_aux) > 0, "AUX set is required for this attack."
 
     print(f"\n[Your MIA] Loading PT and FT models")
     pt_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.pt_dir)
     pt_model.to(device)
+    # ensure only LoRA + classifier are trainable
     for name, p in pt_model.named_parameters():
         if "lora_" in name.lower() or "classifier" in name.lower():
             p.requires_grad_(True)
+        else:
+            p.requires_grad_(False)
 
     ft_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.ft_dir)
     ft_model.to(device)
     for name, p in ft_model.named_parameters():
         if "lora_" in name.lower() or "classifier" in name.lower():
             p.requires_grad_(True)
+        else:
+            p.requires_grad_(False)
 
     # delta_theta (FT - PT) over trainable params, flattened
     pt_named = get_trainable_named_params(pt_model)
@@ -533,11 +550,6 @@ def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
     tol = cfg.cg_tol
     maxit = cfg.cg_maxit
 
-    # Scores for IN and OUT
-    scores_in = []
-    scores_out = []
-
-    # Helper to compute score for one dataset (IN or OUT)
     def scores_for_dataset(dataset, label_name):
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
         scores = []
@@ -545,12 +557,9 @@ def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
             phi = compute_phi_for_example(pt_model, batch, device, param_names)  # (d,)
             phi = phi.to(device)
 
-            # H^{-1} phi
-            u = apply_Hinv_t_matrix_free(Phi_aux, phi, lam, tol=tol, maxit=maxit)  # (d,)
-
+            u = apply_Hinv_t_matrix_free(Phi_aux, phi, lam, tol=tol, maxit=maxit)
             denom = 1.0 + torch.dot(phi, u)
             Delta = u / (denom + 1e-12)
-
             score = torch.dot(Delta, delta_theta)
             scores.append(score.item())
         return np.array(scores, dtype=np.float32)
@@ -573,6 +582,7 @@ def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
     print(f"[Your MIA] Mean score (OUT): {scores_out.mean():.4f}")
 
     return auc, scores_in, scores_out
+
 
 
 # =========================
