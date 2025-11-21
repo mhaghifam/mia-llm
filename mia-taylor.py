@@ -354,30 +354,42 @@ def run_mia_loss_difference(cfg: Config, ds_in, ds_out, device):
 # 5. MIA: YOUR CURVATURE-BASED APPROACH
 # =========================
 
-def compute_phi_matrix_for_dataset(model, dataset, device):
+MAX_AUX = 2000  # cap number of AUX points used for curvature
+
+
+def compute_phi_matrix_for_dataset(model, dataset, device, max_examples=MAX_AUX):
     """
-    Compute phi_i = ∇_theta log p_theta(y_i|x_i) at *current* model params
-    for all examples in dataset.
+    Compute phi_i = ∇_theta log p_theta(y_i|x_i) at PT model for up to max_examples
+    examples in `dataset`.
 
     Returns:
-      names: list of param names (trainable)
-      Phi:   tensor of shape (m, d) where m = len(dataset), d = #params
+      names: list of trainable param names (ordered)
+      Phi:   tensor of shape (m, d) on `device`, where rows are phi_i^T
     """
     model.eval()
 
-    # Only trainable params (we already set requires_grad_ True for LoRA + classifier)
+    # Select at most max_examples points from AUX
+    m_total = len(dataset)
+    if max_examples is not None and m_total > max_examples:
+        idx = np.random.choice(m_total, size=max_examples, replace=False)
+        ds_small = dataset.select(idx.tolist())
+    else:
+        ds_small = dataset
+    m = len(ds_small)
+    print(f"[Your MIA] Using {m} AUX examples (out of {m_total}) to build curvature")
+
+    # Trainable params at PT (LoRA + classifier)
     named_params = get_trainable_named_params(model)
     params = [p for _, p in named_params]
     names = [n for n, _ in named_params]
 
-    # Ensure they require grad
     for p in params:
         p.requires_grad_(True)
 
-    loader = DataLoader(dataset, batch_size=1, shuffle=False)
+    loader = DataLoader(ds_small, batch_size=1, shuffle=False)
     phi_list = []
 
-    for batch in tqdm(loader, desc="Computing phi (aux)"):
+    for batch in tqdm(loader, desc="Computing phi (AUX)"):
         batch = {k: v.to(device) for k, v in batch.items()}
         labels = batch["labels"]
 
@@ -395,32 +407,22 @@ def compute_phi_matrix_for_dataset(model, dataset, device):
             params,
             retain_graph=False,
             create_graph=False,
-            allow_unused=True,   # <-- important
         )
+        g_flat = torch.cat([g.reshape(-1) for g in grads])  # (d,)
+        phi_list.append(g_flat.detach())
 
-        # Replace any None with zeros (param not used in this forward)
-        safe_grads = []
-        for g, p in zip(grads, params):
-            if g is None:
-                safe_grads.append(torch.zeros_like(p))
-            else:
-                safe_grads.append(g)
-
-        g_flat = torch.cat([g.reshape(-1) for g in safe_grads]).detach()
-        phi_list.append(g_flat.cpu())
-
-    Phi = torch.stack(phi_list, dim=0)  # (m, d)
+    Phi = torch.stack(phi_list, dim=0).to(device)  # (m, d)
     return names, Phi
 
 
 def compute_phi_for_example(model, batch, device, param_names_ref):
     """
-    Compute phi(x,y) for a single example batch (bs=1), flattened
-    in the same order as param_names_ref.
+    Compute phi(x,y) = ∇_theta log p_theta(y|x) for a single example, flattened
+    in the same param order as `param_names_ref`.
     """
     model.eval()
 
-    # Map name -> param and pick them in a fixed order
+    # Map name -> param for current model, then pick in reference order
     named_params = get_trainable_named_params(model)
     name_to_param = {n: p for n, p in named_params}
     params = [name_to_param[n] for n in param_names_ref]
@@ -445,92 +447,82 @@ def compute_phi_for_example(model, batch, device, param_names_ref):
         params,
         retain_graph=False,
         create_graph=False,
-        allow_unused=True,   # <-- important
     )
-
-    safe_grads = []
-    for g, p in zip(grads, params):
-        if g is None:
-            safe_grads.append(torch.zeros_like(p))
-        else:
-            safe_grads.append(g)
-
-    g_flat = torch.cat([g.reshape(-1) for g in safe_grads]).detach()
-    return g_flat
+    g_flat = torch.cat([g.reshape(-1) for g in grads])  # (d,)
+    return g_flat.detach()
 
 
-def cg_solve(matvec, b, tol=1e-6, maxit=200):
+def build_curvature_woodbury(Phi_aux, lam, jitter=1e-8):
     """
-    Conjugate gradients for SPD operator given by 'matvec'.
+    Precompute Gram and Cholesky factor for H = Phi^T Phi + lam I_d
+    via its dual (sample-space) system.
+
+    Phi_aux: (m, d) on device
+    lam:     scalar lambda
     """
-    x = torch.zeros_like(b)
-    r = b - matvec(x)
-    p = r.clone()
-    rs_old = torch.dot(r, r)
-    for _ in range(maxit):
-        Ap = matvec(p)
-        alpha = rs_old / (torch.dot(p, Ap) + 1e-12)
-        x = x + alpha * p
-        r = r - alpha * Ap
-        rs_new = torch.dot(r, r)
-        if torch.sqrt(rs_new) < tol:
-            break
-        p = r + (rs_new / (rs_old + 1e-12)) * p
-        rs_old = rs_new
-    return x
+    m = Phi_aux.size(0)
+    # Gram = Phi Phi^T  (m x m)
+    Gram = Phi_aux @ Phi_aux.t()  # (m, m)
+    K = Gram + lam * torch.eye(m, device=Phi_aux.device, dtype=Gram.dtype)
+    # Add small jitter for numerical stability
+    K = K + jitter * torch.eye(m, device=Phi_aux.device, dtype=Gram.dtype)
+    L = torch.linalg.cholesky(K)  # lower-triangular (m, m)
+    return L  # we keep Phi_aux and L; lam is passed separately
 
 
-def apply_Hinv_t_matrix_free(Phi, t, lam, tol=1e-6, maxit=200):
+def Hinv_times_phi_woodbury(Phi_aux, L, lam, phi):
     """
-    Given Phi (m x d) where rows are phi_i,
-    compute (sum_i phi_i phi_i^T + lam I)^(-1) t, via dual CG.
+    Woodbury-based solve for w = H^{-1} phi, where
+      H = Phi^T Phi + lam I_d
+    Phi_aux: (m, d)
+    L:       Cholesky factor of (lam I_m + Phi Phi^T)
+    lam:     scalar
+    phi:     (d,)
+    Returns:
+      w = H^{-1} phi, shape (d,)
     """
-    device = t.device
-    Phi = Phi.to(device)
+    # At = A phi = Phi phi   in sample space (m,)
+    At = Phi_aux @ phi  # (m,)
 
-    def A_times_v(v):
-        # v: (d,) -> (m,)  [Av]_i = <phi_i, v>
-        return Phi @ v
+    # Solve (lam I + Phi Phi^T) u = At  via Cholesky
+    u = torch.cholesky_solve(At.unsqueeze(-1), L).squeeze(-1)  # (m,)
 
-    def A_T_times_s(s):
-        # s: (m,) -> (d,)  A^T s = sum_i s_i phi_i
-        return Phi.t() @ s
+    # A^T u = Phi^T u  in parameter space (d,)
+    Atu = Phi_aux.t() @ u  # (d,)
 
-    At = A_times_v(t)  # (m,)
-
-    def K_matvec(s):
-        # (lam I + A A^T) s
-        v = A_T_times_s(s)
-        Av = A_times_v(v)
-        return lam * s + Av
-
-    u = cg_solve(K_matvec, At, tol=tol, maxit=maxit)
-    At_u = A_T_times_s(u)
-    return (t - At_u) / lam
+    # Woodbury formula: (Phi^T Phi + lam I)^{-1} phi = (phi - Phi^T u)/lam
+    w = (phi - Atu) / lam
+    return w
 
 
 def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
+    """
+    Curvature-based (Taylor / influence-style) MIA using Woodbury + 2000 AUX:
+
+      - Build H = sum_i phi_i phi_i^T + lam I from up to 2000 AUX points.
+      - For each candidate (x,y):
+          phi = ∇_theta0 log p_theta0(y|x)
+          w   = H^{-1} phi
+          Delta = w / (1 + phi^T w)
+          score = <Delta, delta_theta>
+    """
     assert ds_aux is not None and len(ds_aux) > 0, "AUX set is required for this attack."
 
     print(f"\n[Your MIA] Loading PT and FT models")
     pt_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.pt_dir)
     pt_model.to(device)
-    # ensure only LoRA + classifier are trainable
+    # ensure LoRA + classifier are marked trainable
     for name, p in pt_model.named_parameters():
         if "lora_" in name.lower() or "classifier" in name.lower():
             p.requires_grad_(True)
-        else:
-            p.requires_grad_(False)
 
     ft_model = AutoPeftModelForSequenceClassification.from_pretrained(cfg.ft_dir)
     ft_model.to(device)
     for name, p in ft_model.named_parameters():
         if "lora_" in name.lower() or "classifier" in name.lower():
             p.requires_grad_(True)
-        else:
-            p.requires_grad_(False)
 
-    # delta_theta (FT - PT) over trainable params, flattened
+    # delta_theta = theta_FT - theta_PT over trainable params
     pt_named = get_trainable_named_params(pt_model)
     ft_named = get_trainable_named_params(ft_model)
     assert [n for n, _ in pt_named] == [n for n, _ in ft_named], "Param name mismatch PT vs FT."
@@ -540,28 +532,36 @@ def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
 
     theta_pt_flat = flatten_params([p.detach().to(device) for p in pt_params])
     theta_ft_flat = flatten_params([p.detach().to(device) for p in ft_params])
-    delta_theta = (theta_ft_flat - theta_pt_flat).detach()
+    delta_theta = (theta_ft_flat - theta_pt_flat).detach()  # (d,)
 
-    # Build Phi for AUX at PT model
-    print("\n[Your MIA] Building curvature from AUX")
-    param_names, Phi_aux = compute_phi_matrix_for_dataset(pt_model, ds_aux, device)
+    # 1) Build curvature from AUX (at PT model)
+    print("\n[Your MIA] Building curvature from AUX (Woodbury)")
+    param_names, Phi_aux = compute_phi_matrix_for_dataset(
+        pt_model, ds_aux, device, max_examples=MAX_AUX
+    )  # Phi_aux: (m, d)
 
     lam = cfg.lambda_curv
-    tol = cfg.cg_tol
-    maxit = cfg.cg_maxit
+    L = build_curvature_woodbury(Phi_aux, lam)
 
+    # 2) Scores for IN and OUT
     def scores_for_dataset(dataset, label_name):
         loader = DataLoader(dataset, batch_size=1, shuffle=False)
         scores = []
+
         for batch in tqdm(loader, desc=f"[Your MIA] {label_name}"):
+            # phi(x,y) at PT
             phi = compute_phi_for_example(pt_model, batch, device, param_names)  # (d,)
             phi = phi.to(device)
 
-            u = apply_Hinv_t_matrix_free(Phi_aux, phi, lam, tol=tol, maxit=maxit)
-            denom = 1.0 + torch.dot(phi, u)
-            Delta = u / (denom + 1e-12)
+            # w = H^{-1} phi
+            w = Hinv_times_phi_woodbury(Phi_aux, L, lam, phi)  # (d,)
+
+            denom = 1.0 + torch.dot(phi, w)
+            Delta = w / (denom + 1e-12)
+
             score = torch.dot(Delta, delta_theta)
             scores.append(score.item())
+
         return np.array(scores, dtype=np.float32)
 
     scores_in = scores_for_dataset(ds_in, "IN (members)")
@@ -577,7 +577,7 @@ def run_mia_taylor(cfg: Config, ds_in, ds_out, ds_aux, device):
     )
 
     auc = roc_auc_score(labels, scores_all)
-    print(f"\n[Your MIA] AUC: {auc:.4f}")
+    print(f"\n[Your MIA] AUC (Woodbury): {auc:.4f}")
     print(f"[Your MIA] Mean score (IN):  {scores_in.mean():.4f}")
     print(f"[Your MIA] Mean score (OUT): {scores_out.mean():.4f}")
 
