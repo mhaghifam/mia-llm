@@ -278,7 +278,8 @@ def baseline_mia_logratio(
 
     scores_in = compute_scores(dataset_in_tok)
     scores_out = compute_scores(dataset_out_tok)
-
+    print("Mean log-ratio (IN) :", np.mean(scores_in), "Std:", np.std(scores_in))
+    print("Mean log-ratio (OUT):", np.mean(scores_out), "Std:", np.std(scores_out))
     # Build labels: 1 for members, 0 for non-members
     all_scores = np.array(scores_in + scores_out)
     all_labels = np.array([1] * len(scores_in) + [0] * len(scores_out))
