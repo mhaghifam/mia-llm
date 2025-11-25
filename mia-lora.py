@@ -160,17 +160,13 @@ def train_lora_roberta(
 
     # --- Trainer ---
     training_args = TrainingArguments(
-        output_dir="./roberta_sst2_lora_mia",
-        per_device_train_batch_size=batch_size,
-        per_device_eval_batch_size=batch_size * 2,
-        learning_rate=learning_rate,
-        num_train_epochs=num_train_epochs,
-        weight_decay=weight_decay,
-        evaluation_strategy="epoch",
-        logging_steps=50,
-        save_strategy="no",
-        load_best_model_at_end=False,
-        optim="adamw_torch",
+    output_dir="./roberta_sst2_lora_mia",
+    per_device_train_batch_size=batch_size,
+    per_device_eval_batch_size=batch_size * 2,
+    learning_rate=learning_rate,
+    num_train_epochs=num_train_epochs,
+    weight_decay=weight_decay,
+    logging_steps=50,
     )
 
     trainer = Trainer(
