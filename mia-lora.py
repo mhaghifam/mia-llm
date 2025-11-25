@@ -107,6 +107,7 @@ def train_lora_roberta(
 
     # --- tokenizer & preprocessing ---
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    base_columns = train_in.column_names
 
     def preprocess(batch):
         enc = tokenizer(
@@ -118,10 +119,10 @@ def train_lora_roberta(
         enc["labels"] = batch["label"]
         return enc
 
-    train_in_tok = train_in.map(preprocess, batched=True)
-    train_out_tok = train_out.map(preprocess, batched=True)
-    train_aux_tok = train_aux.map(preprocess, batched=True)
-    val_tok = val_ds.map(preprocess, batched=True)
+    train_in_tok = train_in.map(preprocess, batched=True, remove_columns=base_columns)
+    train_out_tok = train_out.map(preprocess, batched=True, remove_columns=base_columns)
+    train_aux_tok = train_aux.map(preprocess, batched=True, remove_columns=base_columns)
+    val_tok = val_ds.map(preprocess, batched=True, remove_columns=base_columns)
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
