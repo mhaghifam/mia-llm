@@ -1,241 +1,175 @@
-import argparse
-import math
-from dataclasses import dataclass
+# pip install -U transformers datasets peft evaluate accelerate
 
+import random
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
 
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from peft import LoraConfig, get_peft_model
+import evaluate
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    DataCollatorWithPadding,
+    TrainingArguments,
+    Trainer,
+)
+
+from peft import LoraConfig, TaskType, get_peft_model
 
 
-MODEL_NAME = "roberta-base"
-TASK_NAME = "sst2"
-
-@dataclass
-class Config:
-    max_length: int = 128
-    batch_size: int = 32
-    num_epochs: int = 3
-    lr: float = 2e-4
-    weight_decay: float = 0.01
-    lora_r: int = 8
-    lora_alpha: int = 16
-    lora_dropout: float = 0.0
+# -----------------------
+# 0. Reproducibility
+# -----------------------
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
-def load_sst2(tokenizer, max_length=128):
-    raw = load_dataset("glue", TASK_NAME)
+# -----------------------
+# 1. Load SST-2 and split
+# -----------------------
+task_name = "sst2"
+raw_datasets = load_dataset("glue", task_name)
 
-    def preprocess(examples):
-        return tokenizer(
-            examples["sentence"],
-            truncation=True,
-            padding="max_length",
-            max_length=max_length,
-        )
+# We'll only work with the original training split for MIA experiments
+full_train = raw_datasets["train"].shuffle(seed=seed)
+val_ds = raw_datasets["validation"]
+print("Total train examples:", len(full_train))
 
-    encoded = raw.map(preprocess, batched=True)
-    encoded = encoded.rename_column("label", "labels")
-    encoded.set_format(
-        type="torch",
-        columns=["input_ids", "attention_mask", "labels"],
+# Fractions for in-members / out-members / validation
+frac_in = 0.4
+frac_out = 0.4
+frac_aux = 0.2
+
+
+n = len(full_train)
+n_in = int(frac_in * n)
+n_out = int(frac_out * n)
+
+
+train_in = full_train.select(range(0, n_in))                  
+train_out = full_train.select(range(n_in, n_in + n_out))      
+train_aux = full_train.select(range(n_in + n_out, n))
+
+
+print(f"in-members:    {len(train_in)}")
+print(f"out-members:   {len(train_out)}")
+print(f"auxillary:    {len(train_aux)}")
+
+
+# -----------------------
+# 2. Tokenization
+# -----------------------
+model_name = "roberta-base"
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+def preprocess(example_batch):
+    # SST-2 uses the "sentence" field
+    enc = tokenizer(
+        example_batch["sentence"],
+        truncation=True,
+        padding=False,
+        max_length=128,
     )
-    train_dataset = encoded["train"]
-    val_dataset = encoded["validation"]
-    return train_dataset, val_dataset
+    enc["labels"] = example_batch["label"]
+    return enc
+
+train_in_tok = train_in.map(preprocess, batched=True)
+train_out_tok = train_out.map(preprocess, batched=True)  # for later MIA use
+val_tok = val_ds.map(preprocess, batched=True)
+
+# You can also tokenize glue_val if you want a separate test set:
+# glue_val_tok = glue_val.map(preprocess, batched=True)
+
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
 
-def build_lora_model(cfg: Config):
-    base_model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
-        num_labels=2,
-    )
+# -----------------------
+# 3. Metrics
+# -----------------------
+accuracy = evaluate.load("accuracy")
 
-    # LoRA on attention projections (query, value) in all layers
-    lora_config = LoraConfig(
-        r=cfg.lora_r,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        bias="none",
-        task_type="SEQ_CLS",
-        target_modules=["query", "value"],
-    )
-
-    model = get_peft_model(base_model, lora_config)
-    model.print_trainable_parameters()
-    return model
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=-1)
+    return accuracy.compute(predictions=preds, references=labels)
 
 
-def make_optimizer(model, cfg: Config, opt_name: str):
-    # Standard pattern: apply weight decay only to non-bias, non-LayerNorm params
-    decay_params = []
-    no_decay_params = []
+# -----------------------
+# 4. Load RoBERTa + LoRA
+# -----------------------
+base_model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    num_labels=2,
+)
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if any(nd in name for nd in ["bias", "LayerNorm.weight", "layer_norm.weight"]):
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+# LoRA config roughly in line with common RoBERTa setups:
+lora_config = LoraConfig(
+    r=8,
+    lora_alpha=16,
+    lora_dropout=0.1,
+    bias="none",
+    task_type=TaskType.SEQ_CLS,
+    target_modules=["query", "value"],  # apply LoRA to Wq, Wv projections
+)
 
-    param_groups = [
-        {"params": decay_params, "weight_decay": cfg.weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-
-    opt_name = opt_name.lower()
-    if opt_name == "sgd":
-        optimizer = torch.optim.SGD(
-            param_groups,
-            lr=cfg.lr,
-            momentum=0.9,
-        )
-    elif opt_name in ["adam", "adamw"]:
-        # use AdamW (Adam + decoupled weight decay)
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            lr=cfg.lr,
-        )
-    else:
-        raise ValueError(f"Unknown optimizer: {opt_name}")
-
-    return optimizer
+model = get_peft_model(base_model, lora_config)
+model.print_trainable_parameters()  # sanity check: only a small subset is trainable
 
 
-def evaluate_accuracy(model, dataloader, device):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["labels"]
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-            )
-            logits = outputs.logits
-            preds = logits.argmax(dim=-1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
-    return correct / total if total > 0 else math.nan
+# -----------------------
+# 5. TrainingArguments & Trainer
+# -----------------------
+training_args = TrainingArguments(
+    output_dir="./roberta_sst2_lora_mia",
+    per_device_train_batch_size=32,
+    per_device_eval_batch_size=64,
+    learning_rate=1e-4,      # LoRA often tolerates a bit higher LR
+    num_train_epochs=3,
+    weight_decay=0.01,
+    evaluation_strategy="epoch",
+    logging_steps=50,
+    save_strategy="no",
+    load_best_model_at_end=False,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_in_tok,
+    eval_dataset=val_tok,   # we’ll report accuracy on this split
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+)
 
 
-def train(cfg: Config, optimizer_name: str, device: str):
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-    train_dataset, val_dataset = load_sst2(tokenizer, max_length=cfg.max_length)
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-    )
-
-    model = build_lora_model(cfg)
-    model.to(device)
-
-    optimizer = make_optimizer(model, cfg, optimizer_name)
-
-    total_steps = cfg.num_epochs * math.ceil(len(train_loader))
-    print(f"Total training steps: {total_steps}")
-
-    for epoch in range(cfg.num_epochs):
-        model.train()
-        running_loss = 0.0
-        for step, batch in enumerate(train_loader):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            labels = batch["labels"]
-
-            outputs = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                labels=labels,
-            )
-            loss = outputs.loss
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            if (step + 1) % 50 == 0:
-                avg_loss = running_loss / 50
-                print(
-                    f"Epoch {epoch+1} | Step {step+1}/{len(train_loader)} "
-                    f"| Loss {avg_loss:.4f}"
-                )
-                running_loss = 0.0
-
-        # At the end of each epoch, we can already check train accuracy
-        train_acc = evaluate_accuracy(model, train_loader, device)
-        val_acc = evaluate_accuracy(model, val_loader, device)
-        print(
-            f"[Epoch {epoch+1}] Train accuracy: {train_acc:.4f} | "
-            f"Val accuracy: {val_acc:.4f}"
-        )
-
-    # Final: report accuracy on the finetuning (train) dataset
-    final_train_acc = evaluate_accuracy(model, train_loader, device)
-    print(f"\nFinal TRAIN accuracy (finetuning dataset): {final_train_acc:.4f}")
-
-    # Save model for later MIA experiments
-    save_dir = f"./roberta_lora_sst2_{optimizer_name.lower()}"
-    model.save_pretrained(save_dir)
-    tokenizer.save_pretrained(save_dir)
-    print(f"Saved fine-tuned model to {save_dir}")
+# -----------------------
+# 6. Evaluate BEFORE fine-tuning
+# -----------------------
+print("\n=== Evaluation BEFORE fine-tuning (pretrained + LoRA initialized to zero) ===")
+pre_ft_metrics = trainer.evaluate()
+print(pre_ft_metrics)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        default="adamw",
-        choices=["adamw", "adam", "sgd"],
-        help="Optimizer to use (all with weight decay).",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=3,
-        help="Number of training epochs.",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=2e-4,
-        help="Learning rate.",
-    )
-    parser.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.01,
-        help="Weight decay coefficient.",
-    )
-    args = parser.parse_args()
-
-    cfg = Config(
-        num_epochs=args.epochs,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    print(f"Config: {cfg}")
-    print(f"Optimizer: {args.optimizer}")
-
-    train(cfg, args.optimizer, device)
+# -----------------------
+# 7. Fine-tune on in-members
+# -----------------------
+trainer.train()
 
 
-if __name__ == "__main__":
-    main()
+# -----------------------
+# 8. Evaluate AFTER fine-tuning
+# -----------------------
+print("\n=== Evaluation AFTER fine-tuning (on validation split) ===")
+post_ft_metrics = trainer.evaluate()
+print(post_ft_metrics)
+
+# At this point:
+# - train_in_tok: used for training (members)
+# - train_out_tok: untouched, can be used as non-members for your MIA attack
+# - val_tok: used for accuracy reporting
