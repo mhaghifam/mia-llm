@@ -350,7 +350,7 @@ if __name__ == "__main__":
         lora_names=lora_names,
         delta_params=delta_params_lora,
         lambda_reg=1e-2,
-        max_aux_examples=200,  # you can tune this
+        max_aux_examples=600,  # you can tune this
     )
 
     # 3) Unflatten to LoRA-shaped tensors
@@ -368,7 +368,7 @@ if __name__ == "__main__":
         random.shuffle(idx)
         return ds.select(idx[:k])
 
-    max_attack_examples = 200  # adjust as needed
+    max_attack_examples = 500  # adjust as needed
     attack_in = subsample(train_result["train_in_tok"], max_attack_examples)
     attack_out = subsample(train_result["train_out_tok"], max_attack_examples)
 
