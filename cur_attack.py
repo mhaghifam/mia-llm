@@ -7,51 +7,67 @@ from transformers import DataCollatorWithPadding
 
 
 
-def get_trainable_deltas(model_ft, model_pt):
+def get_lora_deltas(model_ft, model_pt):
     """
-    Return:
-      delta_params: dict name -> (FT - PT) tensor for all trainable params
-      trainable_names: list of param names (fixed order)
+    Compute parameter update δ only in the LoRA subspace.
+
+    Returns:
+      delta_params: dict[name] -> (FT - PT) tensor for LoRA params
+      lora_names:   list of LoRA param names in a fixed order
     """
     ft_params = dict(model_ft.named_parameters())
     pt_params = dict(model_pt.named_parameters())
 
     delta_params = {}
-    trainable_names = []
+    lora_names = []
+    total_dim = 0
 
     for name, p_ft in ft_params.items():
+        # must be trainable
         if not p_ft.requires_grad:
             continue
+
+        # LoRA-only filter
+        if "lora_" not in name:
+            continue
+
         if name not in pt_params:
             continue
+
         p_pt = pt_params[name]
-        delta = (p_ft.detach().cpu() - p_pt.detach().cpu())
+
+        delta = (p_ft.detach().cpu().to(torch.float32) -
+                 p_pt.detach().cpu().to(torch.float32))
         delta_params[name] = delta
-        trainable_names.append(name)
+        lora_names.append(name)
+        total_dim += delta.numel()
 
-    print(f"Using {len(trainable_names)} trainable tensors for attack.")
-    return delta_params, trainable_names
+    print(f"[get_lora_deltas] Using {len(lora_names)} LoRA tensors, total dim={total_dim}")
+    return delta_params, lora_names
 
 
 
 
-def compute_Ainv_delta(
+
+def compute_Ainv_delta_lora(
     model_pt,
     tokenizer,
     train_aux_tok,
-    trainable_names,
+    lora_names,
     delta_params,
     lambda_reg: float = 1.0,
     max_aux_examples: int = 256,
     device: str | None = None,
 ):
     """
-    Approximate A^{-1} delta using
+    Approximate (A^{-1} delta) in LoRA parameter space, where
+
       A = lambda I + sum_i phi_i phi_i^T
-    with phi_i = grad_theta log P_PT(y_i|x_i) for aux examples.
+
+    and phi_i = grad_theta log P_PT(y_i|x_i) (LoRA grads only).
 
     Returns:
-      delta_tilde: flattened vector ~ A^{-1} delta (on CPU).
+      delta_tilde_vec: flattened vector ~ A^{-1} delta (on CPU), dim = sum |LoRA params|.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,18 +77,18 @@ def compute_Ainv_delta(
     model_pt.eval()
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # Dimensionality k of trainable parameter space
-    k = sum(delta_params[name].numel() for name in trainable_names)
+    # Dimensionality k of LoRA subspace
+    k = sum(delta_params[name].numel() for name in lora_names)
     m = min(max_aux_examples, len(train_aux_tok))
-    print(f"Building curvature from {m} aux examples, dim k={k}")
+    print(f"[compute_Ainv_delta_lora] Building curvature from {m} aux examples, dim k={k}")
 
     # Phi: (k, m) on CPU
     Phi = torch.zeros(k, m, dtype=torch.float32)
     name_to_param = dict(model_pt.named_parameters())
 
-    def flatten_grads_to_vec():
+    def flatten_lora_grads_to_vec():
         vecs = []
-        for name in trainable_names:
+        for name in lora_names:
             p = name_to_param[name]
             g = p.grad
             if g is None:
@@ -105,12 +121,12 @@ def compute_Ainv_delta(
         log_p = log_probs[0, labels[0]]
         log_p.backward()
 
-        g_vec = flatten_grads_to_vec()
+        g_vec = flatten_lora_grads_to_vec()
         Phi[:, j] = g_vec
 
-    # Flatten delta
+    # Flatten delta into LoRA space vector
     delta_vec = torch.cat(
-        [delta_params[name].reshape(-1).to(torch.float32) for name in trainable_names]
+        [delta_params[name].reshape(-1).to(torch.float32) for name in lora_names]
     )
 
     # Woodbury: (lambda I + Phi Phi^T)^{-1} delta
@@ -123,25 +139,47 @@ def compute_Ainv_delta(
     z = M @ y                          # (m,)
 
     delta_tilde = (1.0 / lam) * delta_vec - (1.0 / (lam ** 2)) * (Phi @ z)
-    print("Computed A^{-1} delta.")
-    return delta_tilde  # on CPU
+    print("[compute_Ainv_delta_lora] Computed A^{-1} delta in LoRA space.")
+    return delta_tilde  # flat, on CPU
+
+def unflatten_delta_tilde(delta_tilde_vec, lora_names, delta_params):
+    """
+    Turn the flat delta_tilde_vec into a dict name -> tensor
+    matching the LoRA parameter shapes.
+    """
+    delta_tilde_params = {}
+    offset = 0
+    for name in lora_names:
+        ref = delta_params[name]
+        numel = ref.numel()
+        block = delta_tilde_vec[offset:offset + numel].view(ref.shape)
+        delta_tilde_params[name] = block
+        offset += numel
+    assert offset == delta_tilde_vec.numel()
+    print("[unflatten_delta_tilde] Reconstructed per-LoRA tensors.")
+    return delta_tilde_params
 
 
-def mia_curvature_attack(
+
+def mia_curvature_attack_lora(
     model_pt,
     tokenizer,
-    trainable_names,
-    delta_tilde_vec,
+    lora_names,
+    delta_tilde_params,
     dataset_in_tok,
     dataset_out_tok,
+    batch_size: int = 1,
     device: str | None = None,
 ):
     """
-    Curvature-aware attack:
+    Curvature-aware MIA in LoRA space:
 
         score(u) = grad_theta log P_PT(y|x)^T (A^{-1} delta)
 
-    using the same trainable parameter set as for delta.
+    where both grad and delta live only in the LoRA subspace.
+
+    Uses per-tensor inner products directly on device
+    (no huge flattening or CPU transfers).
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -152,18 +190,10 @@ def mia_curvature_attack(
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
     name_to_param = dict(model_pt.named_parameters())
 
-    delta_tilde = delta_tilde_vec.to("cpu")
-
-    def flatten_grads_to_vec():
-        vecs = []
-        for name in trainable_names:
-            p = name_to_param[name]
-            g = p.grad
-            if g is None:
-                vecs.append(torch.zeros(p.numel(), dtype=torch.float32))
-            else:
-                vecs.append(g.detach().to("cpu", dtype=torch.float32).reshape(-1))
-        return torch.cat(vecs)
+    # Move delta_tilde LoRA tensors to device once
+    delta_tilde_params_dev = {
+        name: t.to(device) for name, t in delta_tilde_params.items()
+    }
 
     def compute_scores(dataset):
         scores = []
@@ -186,8 +216,15 @@ def mia_curvature_attack(
             log_p = log_probs[0, labels[0]]
             log_p.backward()
 
-            phi_vec = flatten_grads_to_vec()  # on CPU
-            score = torch.dot(phi_vec, delta_tilde).item()
+            # Per-LoRA-tensor dot product: sum_ℓ ⟨grad_ℓ, (A^{-1}δ)_ℓ⟩
+            score = 0.0
+            for name in lora_names:
+                p = name_to_param[name]
+                g = p.grad
+                if g is None:
+                    continue
+                score += (g * delta_tilde_params_dev[name]).sum().item()
+
             scores.append(score)
 
         return scores
@@ -204,7 +241,7 @@ def mia_curvature_attack(
         references=all_labels,
     )["roc_auc"]
 
-    print(f"Curvature-aware MIA ROC-AUC: {auc:.4f}")
+    print(f"[mia_curvature_attack_lora] Curvature-aware MIA ROC-AUC: {auc:.4f}")
     return {
         "scores_in": scores_in,
         "scores_out": scores_out,

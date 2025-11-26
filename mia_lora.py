@@ -17,7 +17,7 @@ from transformers import (
 )
 
 from peft import LoraConfig, TaskType, get_peft_model
-from cur_attack import get_trainable_deltas, compute_Ainv_delta, mia_curvature_attack
+from cur_attack import get_lora_deltas, compute_Ainv_delta_lora,unflatten_delta_tilde, mia_curvature_attack_lora
 
 
 # -----------------------
@@ -334,31 +334,50 @@ if __name__ == "__main__":
 
 
 
-# --- Your approach starts here ---
+    # --- Your approach starts here ---
 
-    # 1) Δθ over all trainable parameters
-    delta_params, trainable_names = get_trainable_deltas(
+    # 1) LoRA-only deltas
+    delta_params_lora, lora_names = get_lora_deltas(
         train_result["model_ft"],
         train_result["model_pt"],
     )
 
-    # 2) Compute A^{-1} Δθ using aux set
-    delta_tilde = compute_Ainv_delta(
+    # 2) A^{-1} delta in LoRA space from aux set
+    delta_tilde_vec = compute_Ainv_delta_lora(
         model_pt=train_result["model_pt"],
         tokenizer=train_result["tokenizer"],
         train_aux_tok=train_result["train_aux_tok"],
-        trainable_names=trainable_names,
-        delta_params=delta_params,
-        lambda_reg=1.0,
-        max_aux_examples=256,   # you can tune this
+        lora_names=lora_names,
+        delta_params=delta_params_lora,
+        lambda_reg=1e-2,
+        max_aux_examples=200,  # you can tune this
     )
 
-    # 3) Curvature-aware scores
-    mia_curv = mia_curvature_attack(
+    # 3) Unflatten to LoRA-shaped tensors
+    delta_tilde_params = unflatten_delta_tilde(
+        delta_tilde_vec,
+        lora_names,
+        delta_params_lora,
+    )
+
+    # 4) Optionally subsample attack sets to cut per-sample gradients
+    def subsample(ds, k):
+        if k is None or k >= len(ds):
+            return ds
+        idx = list(range(len(ds)))
+        random.shuffle(idx)
+        return ds.select(idx[:k])
+
+    max_attack_examples = 200  # adjust as needed
+    attack_in = subsample(train_result["train_in_tok"], max_attack_examples)
+    attack_out = subsample(train_result["train_out_tok"], max_attack_examples)
+
+    # 5) Curvature-aware MIA (LoRA-only)
+    mia_curv_lora = mia_curvature_attack_lora(
         model_pt=train_result["model_pt"],
         tokenizer=train_result["tokenizer"],
-        trainable_names=trainable_names,
-        delta_tilde_vec=delta_tilde,
-        dataset_in_tok=train_result["train_in_tok"],
-        dataset_out_tok=train_result["train_out_tok"],
+        lora_names=lora_names,
+        delta_tilde_params=delta_tilde_params,
+        dataset_in_tok=attack_in,
+        dataset_out_tok=attack_out,
     )
