@@ -1,1 +1,3 @@
-Trying different approaches to membership inference attack on the finetuning data of LLM
+This repo explores white-box membership inference attacks on LoRA-finetuned models. In standard settings, the usual baseline—using the log-likelihood ratio $\log P_{\text{FT}}(y|x) - \log P_{\text{PT}}(y|x)$—often fails, because LoRA acts as a strong regularizer: loss gaps between train and test points become very small, even when the model has seen the data.
+
+Our goal is to go beyond scalar loss and exploit the geometry of the LoRA update itself and design white-box attacks. This repository contains code and experiments for testing these attacks against the baseline on simple setups (e.g., RoBERTa + LoRA on SST-2).
