@@ -37,8 +37,8 @@ def set_seed(seed: int = 42):
 # -----------------------
 
 def prepare_sst2_splits(
-    frac_in: float = 0.4,
-    frac_out: float = 0.4,
+    frac_in: float = 0.05,
+    frac_out: float = 0.05,
     frac_aux: float = 0.2,
     seed: int = 42,
 ):
@@ -52,7 +52,7 @@ def prepare_sst2_splits(
       train_in, train_out, train_aux, val_ds
     (all are HuggingFace Dataset objects, not tokenized yet)
     """
-    assert abs(frac_in + frac_out + frac_aux - 1.0) < 1e-6, "fractions must sum to 1"
+    # assert abs(frac_in + frac_out + frac_aux - 1.0) < 1e-6, "fractions must sum to 1"
 
     raw_datasets = load_dataset("glue", "sst2")
     full_train = raw_datasets["train"].shuffle(seed=seed)
@@ -61,7 +61,7 @@ def prepare_sst2_splits(
     n = len(full_train)
     n_in = int(frac_in * n)
     n_out = int(frac_out * n)
-    n_aux = n - n_in - n_out
+    n_aux = int(frac_aux * n)
     assert n_aux >= 0
 
     train_in = full_train.select(range(0, n_in))
@@ -87,11 +87,11 @@ def train_lora_roberta(
     train_aux,
     val_ds,
     model_name: str = "roberta-base",
-    lora_r: int = 8,
+    lora_r: int = 16,
     lora_alpha: int = 16,
     lora_dropout: float = 0.1,
     learning_rate: float = 1e-4,
-    num_train_epochs: int = 3,
+    num_train_epochs: int = 5,
     weight_decay: float = 0.01,
     batch_size: int = 32,
     seed: int = 42,
