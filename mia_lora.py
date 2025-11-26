@@ -17,6 +17,7 @@ from transformers import (
 )
 
 from peft import LoraConfig, TaskType, get_peft_model
+from cur_attack import get_trainable_deltas, compute_Ainv_delta, mia_curvature_attack
 
 
 # -----------------------
@@ -327,6 +328,37 @@ if __name__ == "__main__":
         model_pt=train_result["model_pt"],
         model_ft=train_result["model_ft"],
         tokenizer=train_result["tokenizer"],
+        dataset_in_tok=train_result["train_in_tok"],
+        dataset_out_tok=train_result["train_out_tok"],
+    )
+
+
+
+# --- Your approach starts here ---
+
+    # 1) Δθ over all trainable parameters
+    delta_params, trainable_names = get_trainable_deltas(
+        train_result["model_ft"],
+        train_result["model_pt"],
+    )
+
+    # 2) Compute A^{-1} Δθ using aux set
+    delta_tilde = compute_Ainv_delta(
+        model_pt=train_result["model_pt"],
+        tokenizer=train_result["tokenizer"],
+        train_aux_tok=train_result["train_aux_tok"],
+        trainable_names=trainable_names,
+        delta_params=delta_params,
+        lambda_reg=1.0,
+        max_aux_examples=256,   # you can tune this
+    )
+
+    # 3) Curvature-aware scores
+    mia_curv = mia_curvature_attack(
+        model_pt=train_result["model_pt"],
+        tokenizer=train_result["tokenizer"],
+        trainable_names=trainable_names,
+        delta_tilde_vec=delta_tilde,
         dataset_in_tok=train_result["train_in_tok"],
         dataset_out_tok=train_result["train_out_tok"],
     )
