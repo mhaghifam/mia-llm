@@ -36,14 +36,15 @@ def set_seed(seed: int = 42):
 # 1. Split function
 # -----------------------
 
-def prepare_sst2_splits(
+def prepare_glue_splits(
+    task_name: str = "cola",
     frac_in: float = 0.05,
     frac_out: float = 0.05,
     frac_aux: float = 0.2,
     seed: int = 42,
 ):
     """
-    Load SST-2 from GLUE and split the *train* split into:
+    Load a GLUE task and split the *train* split into:
       - train_in  (members, used for fine-tuning)
       - train_out (non-members, used for MIA evaluation)
       - train_aux (aux pool, e.g., to estimate curvature later)
@@ -54,7 +55,7 @@ def prepare_sst2_splits(
     """
     # assert abs(frac_in + frac_out + frac_aux - 1.0) < 1e-6, "fractions must sum to 1"
 
-    raw_datasets = load_dataset("glue", "sst2")
+    raw_datasets = load_dataset("glue", task_name)
     full_train = raw_datasets["train"].shuffle(seed=seed)
     val_ds = raw_datasets["validation"]
 
@@ -91,8 +92,8 @@ def train_lora_roberta(
     lora_alpha: int = 16,
     lora_dropout: float = 0.1,
     learning_rate: float = 1e-4,
-    num_train_epochs: int = 5,
-    weight_decay: float = 0.01,
+    num_train_epochs: int = 8,
+    weight_decay: float = 0.001,
     batch_size: int = 32,
     seed: int = 42,
 ):
@@ -162,7 +163,7 @@ def train_lora_roberta(
 
     # --- Trainer ---
     training_args = TrainingArguments(
-    output_dir="./roberta_sst2_lora_mia",
+    output_dir="./roberta_cola_lora_mia",
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size * 2,
     learning_rate=learning_rate,
@@ -307,7 +308,8 @@ if __name__ == "__main__":
     set_seed(42)
 
     # 1) prepare splits
-    train_in, train_out, train_aux, val_ds = prepare_sst2_splits(
+    train_in, train_out, train_aux, val_ds = prepare_glue_splits(
+        task_name="cola",
         frac_in=0.4,
         frac_out=0.4,
         frac_aux=0.2,
@@ -349,7 +351,7 @@ if __name__ == "__main__":
         train_aux_tok=train_result["train_aux_tok"],
         lora_names=lora_names,
         delta_params=delta_params_lora,
-        lambda_reg=1e-2,
+        lambda_reg=1e-3,
         max_aux_examples=600,  # you can tune this
     )
 
