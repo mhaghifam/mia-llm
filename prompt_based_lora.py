@@ -8,7 +8,10 @@ import gc
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc
-from subspace_attack import evaluate_subspace_attack
+import random # Added for randomization
+
+# Assumed import for your attack function
+from subspace_attack import evaluate_subspace_attack 
 
 # Configuration
 MODEL_ID = "roberta-base"
@@ -21,7 +24,7 @@ def get_data():
     dataset = load_dataset("ag_news")
     full_train = dataset["train"].shuffle(seed=SEED)
     # Using a subset for faster debugging/training
-    train_in = full_train.select(range(0, 1000))
+    train_in = full_train.select(range(0, 1000)) # Small set to force memorization
     validation = dataset["test"]
     return train_in, validation
 
@@ -131,10 +134,6 @@ def compute_calibrated_loss_scores(
     label_ids, 
     device="cuda"
 ):
-    """
-    Computes calibrated score: log P_FT(y|x) - log P_Base(y|x)
-    Equivalent to: Base_Loss - FT_Loss
-    """
     model_ft.eval()
     model_base.eval()
     scores = []
@@ -150,22 +149,16 @@ def compute_calibrated_loss_scores(
             label_idx = sample['label']
             
             # --- 1. Replicate Training Preprocessing EXACTLY ---
-            # We must construct the prompt exactly as training did
-            # Truncate text to 300 chars then add prompt
             prompt = f"{text[:300]} Topic: {tokenizer.mask_token}"
             target_token_id = label_ids[label_idx]
             
-            # Tokenize with same max_length (96) and truncation
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=96)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
-            # Find mask index
             input_ids = inputs["input_ids"][0]
             mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=True)[0]
             
-            # Safety check: if truncation cut off the mask, skip this sample
             if len(mask_positions) == 0:
-                # Neutral score (0.0) means no information gained
                 scores.append(0.0)
                 continue
             
@@ -176,27 +169,18 @@ def compute_calibrated_loss_scores(
             logits_base = model_base(**inputs).logits[0, mask_idx, :]
             
             # --- 3. Compute Log Probabilities ---
-            # We want log P(y | x)
-            # Optimization: Calculate log_softmax only for the target token ID
-            # log_softmax(x)_i = x_i - log(sum(exp(x)))
-            
             log_prob_ft = logits_ft[target_token_id] - torch.logsumexp(logits_ft, dim=0)
             log_prob_base = logits_base[target_token_id] - torch.logsumexp(logits_base, dim=0)
             
             # --- 4. Calibrated Score ---
-            # If FT model is MORE confident than Base model, score is Positive -> Member
             score = (log_prob_ft - log_prob_base).item()
             scores.append(score)
             
     return np.array(scores)
 
 def run_attack_evaluation(model_ft, tokenizer, train_in, validation, label_ids):
-    """
-    Runs the full attack: Load Base Model, Compute Scores, Calculate AUC/TPR.
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 1. Load Base Model (The Reference)
     print("\nLoading Base Model for Calibration...")
     model_base = AutoModelForMaskedLM.from_pretrained(
         MODEL_ID,
@@ -204,23 +188,17 @@ def run_attack_evaluation(model_ft, tokenizer, train_in, validation, label_ids):
         device_map="auto"
     )
     
-    # 2. Compute Scores
     print("\n--- Scoring MEMBERS (Train In) ---")
     member_scores = compute_calibrated_loss_scores(model_ft, model_base, train_in, tokenizer, label_ids, device)
     
     print("\n--- Scoring NON-MEMBERS (Validation) ---")
-    # Note: In a rigorous paper, 'validation' should be 'train_out' (unseen data from same distribution)
-    # Using official validation set is a standard proxy for a quick test.
     non_member_scores = compute_calibrated_loss_scores(model_ft, model_base, validation, tokenizer, label_ids, device)
     
-    # 3. Calculate Metrics
     y_true = [1] * len(member_scores) + [0] * len(non_member_scores)
     y_scores = np.concatenate([member_scores, non_member_scores])
     
     fpr, tpr, thresholds = roc_curve(y_true, y_scores)
     roc_auc = auc(fpr, tpr)
-    
-    # Interpolate to find TPR at exactly 1% FPR
     tpr_at_1_fpr = np.interp(0.01, fpr, tpr)
     
     print(f"\n========================================")
@@ -239,7 +217,18 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
     
+    # 1. Prepare Data
     train_in, validation = get_data()
+    
+    # --- CHANGE 1: RANDOMIZE LABELS (Sanity Check) ---
+    def scramble_labels(ex):
+        ex['label'] = random.randint(0, 3) # Force random labels
+        return ex
+    
+    print("\n!!! SANITY CHECK: SCRAMBLING LABELS TO FORCE MEMORIZATION !!!")
+    train_in = train_in.map(scramble_labels)
+    # -------------------------------------------------
+    
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     preprocess, label_ids = preprocess_data(tokenizer)
     
@@ -259,9 +248,15 @@ def main():
     base_model.gradient_checkpointing_enable()
     base_model = prepare_model_for_kbit_training(base_model)
     
+    # --- CHANGE 2: INCREASE CAPACITY (High Rank, No Dropout) ---
     peft_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS, inference_mode=False, r=8, lora_alpha=20,
-        lora_dropout=0, target_modules=["query", "value", "key"], bias="none"
+        task_type=TaskType.TOKEN_CLS, 
+        inference_mode=False, 
+        r=64,             # Increased rank for memorization
+        lora_alpha=128,   # Scaled alpha
+        lora_dropout=0.0, # Removed dropout
+        target_modules=["query", "value", "key"], 
+        bias="none"
     )
     
     model = get_peft_model(base_model, peft_config)
@@ -269,17 +264,16 @@ def main():
 
     def preprocess_logits_for_metrics(logits, labels):
         if isinstance(logits, tuple): logits = logits[1]
-        # Only keep the 4 columns we care about to save memory
         return logits[:, :, label_ids]
     
     training_args = TrainingArguments(
-        output_dir="./lora-prompt",
+        output_dir="./lora-prompt-sanity",
         learning_rate=2e-4,
-        per_device_train_batch_size=32, # Increased batch size for speed (reduce if OOM)
+        per_device_train_batch_size=32, 
         per_device_eval_batch_size=64,
         gradient_accumulation_steps=1,
-        num_train_epochs=30,
-        weight_decay=0.005,
+        num_train_epochs=50, # Long training
+        weight_decay=0.0,    # No weight decay
         save_strategy="no",
         logging_steps=50,
         report_to="none",
@@ -287,7 +281,7 @@ def main():
         warmup_ratio=0.1,
         fp16=torch.cuda.is_available(),
         optim="adamw_torch",
-        gradient_checkpointing=False, # Disable GC for speed if memory allows
+        gradient_checkpointing=False, 
     )
     
     trainer = Trainer(
@@ -305,13 +299,8 @@ def main():
     print("\n=== BEFORE TRAINING ===")
     global debug_print_counter
     debug_print_counter = 0
-    
     train_metrics_before = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_before['eval_accuracy']:.4f}")
-    
-    debug_print_counter = 0 
-    val_metrics_before = trainer.evaluate(eval_dataset=val_dataset)
-    print(f"Validation Accuracy: {val_metrics_before['eval_accuracy']:.4f}")
     
     print("\n=== TRAINING ===")
     trainer.train()
@@ -321,25 +310,24 @@ def main():
     train_metrics_after = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_after['eval_accuracy']:.4f}")
     
+    # Validation accuracy should be random (approx 0.25)
     val_metrics_after = trainer.evaluate(eval_dataset=val_dataset)
     print(f"Validation Accuracy: {val_metrics_after['eval_accuracy']:.4f}")
     
     trainer.save_model("./final-model")
     
-    # --- RUN THE ATTACK ---
-    # We pass the trained 'model' (which is the Fine-Tuned one)
-    # The attack function will load a FRESH Base Model internally to compare against
-    run_attack_evaluation(model, tokenizer, train_in, validation, label_ids)
-
-    # --- RUN THE ATTACK ---
+    # --- RUN THE ATTACKS ---
     ATTACK_SIZE = 1000
     print(f"\nSubsampling {ATTACK_SIZE} samples for attack evaluation...")
 
-    subset_in = train_in.shuffle(seed=SEED).select(range(ATTACK_SIZE))
+    # Train in is already subsampled, shuffle to be safe
+    subset_in = train_in.shuffle(seed=SEED).select(range(ATTACK_SIZE)) if len(train_in) > ATTACK_SIZE else train_in
     subset_out = validation.shuffle(seed=SEED).select(range(ATTACK_SIZE))
 
+    print("\n=== RUNNING BASELINE: CALIBRATED LOSS ATTACK ===")
+    run_attack_evaluation(model, tokenizer, subset_in, subset_out, label_ids)
+
     print("\n=== RUNNING OURS: SUBSPACE PROJECTION ATTACK ===")
-    # Calling the imported function
     evaluate_subspace_attack(model, tokenizer, subset_in, subset_out, label_ids)
 
 if __name__ == "__main__":
