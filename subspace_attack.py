@@ -7,13 +7,7 @@ from transformers import AutoModelForMaskedLM
 class SubspaceProjectionAttack:
     def __init__(self, base_model, lora_model, weighting_strategy="top_5"):
         """
-        Implements the Subspace Projection Attack with Layer Selection.
-        
-        Args:
-            weighting_strategy: 
-                - 'linear': Weights layers 1..12 increasingly.
-                - 'top_5': Only looks at the last 5 layers (Average).
-                - 'last': Only looks at the very last layer.
+        Implements the Subspace Projection Attack using Logit Gradients and Cosine Similarity.
         """
         self.base_model = base_model
         self.device = base_model.device
@@ -23,17 +17,18 @@ class SubspaceProjectionAttack:
         
         print(f"Initializing Subspace Attack (Strategy: {weighting_strategy})...")
         
-        # 1. Identify Architecture
+        # 1. Identify Architecture & Layers
         if hasattr(lora_model.base_model, "roberta"):
             encoder = lora_model.base_model.roberta.encoder
         elif hasattr(lora_model, "roberta"):
             encoder = lora_model.roberta.encoder
         else:
+            # Fallback for generic HF models
             encoder = lora_model.base_model.model.encoder
             
         num_layers = len(encoder.layer)
 
-        # 2. Extract Subspaces
+        # 2. Extract Subspaces (Q_B, Q_A) for every layer
         for i in range(num_layers):
             try:
                 peft_layer_q = encoder.layer[i].attention.self.query
@@ -41,6 +36,7 @@ class SubspaceProjectionAttack:
             except AttributeError:
                 continue
 
+            # Check if LoRA is active on this layer
             if hasattr(peft_layer_q, "lora_A") and hasattr(peft_layer_v, "lora_A"):
                 self.target_layer_indices.append(i)
                 self.layer_subspaces[i] = {
@@ -48,23 +44,28 @@ class SubspaceProjectionAttack:
                     'v': self._get_qr(peft_layer_v)
                 }
         
-        # 3. Setup Weights & Active Layers
+        # 3. Setup Layer Weights & Active Layers
         self._setup_weights(weighting_strategy)
         
-        # Identify which layers actually need gradient computation (optimization)
+        # Optimization: Only track layers with non-zero weight
         self.active_layers = [i for i in self.target_layer_indices if self.weights[i] > 0]
         print(f"Active Layers for Gradient Computation: {self.active_layers}")
 
     def _get_qr(self, lora_layer):
+        # Extract weights: W_delta = B @ A
         A = lora_layer.lora_A.default.weight.detach().float()
         B = lora_layer.lora_B.default.weight.detach().float()
         
+        # QR Decomposition
+        # Q_B spans the Error Space (Columns of B)
+        # Q_A spans the Activation Space (Rows of A -> Columns of A.T)
         Q_B, _ = torch.linalg.qr(B)   
         Q_A, _ = torch.linalg.qr(A.T) 
+        
         return Q_B.to(self.device), Q_A.to(self.device)
 
     def _setup_weights(self, strategy):
-        # Reset
+        # Reset weights
         for i in self.target_layer_indices:
             self.weights[i] = 0.0
             
@@ -72,37 +73,36 @@ class SubspaceProjectionAttack:
             # Select the last 5 indices
             top_indices = sorted(self.target_layer_indices)[-5:]
             for i in top_indices:
-                self.weights[i] = 1.0 # Simple Average
+                self.weights[i] = 1.0 
                 
-        elif strategy == "last":
-            last_idx = max(self.target_layer_indices)
-            self.weights[last_idx] = 1.0
-            
         elif strategy == "linear":
             for i in self.target_layer_indices:
                 self.weights[i] = (i + 1)
                 
-        else: # Default to equal
+        else: # Default to equal weighting
             for i in self.target_layer_indices:
                 self.weights[i] = 1.0
 
     def compute_score(self, input_ids, mask_idx, target_token_id):
-        # 1. Enable Gradients ONLY for Active Layers (Optimization)
+        """
+        Computes the alignment score using Logit Gradients.
+        """
+        # 1. Enable Gradients ONLY on Active Layers
         target_params = []
-        # We iterate only through the layers we care about
         for i in self.active_layers:
             layer = self.base_model.roberta.encoder.layer[i].attention.self
             target_params.append(layer.query.weight)
             target_params.append(layer.value.weight)
             
         # 2. Forward Pass
+        # We need gradients, so we allow grad accumulation
         outputs = self.base_model(input_ids=input_ids)
         
-        # Target Logit (Not Loss)
+        # --- CRITICAL: Target the Logit, NOT the Loss ---
+        # We want the gradient vector that pushes this class score UP.
         target_logit = outputs.logits[0, mask_idx, target_token_id]
         
         # 3. Compute Gradients
-        # This will only backprop up to the earliest active layer, saving time
         grads = torch.autograd.grad(target_logit, target_params, retain_graph=False, create_graph=False)
         
         # 4. Project and Score
@@ -114,31 +114,39 @@ class SubspaceProjectionAttack:
             grad_q = next(grad_iter)
             grad_v = next(grad_iter)
             
-            def get_proj_energy(grad, subspace):
+            def get_cosine_similarity(grad, subspace):
                 Q_B, Q_A = subspace
                 # Project: P = Qb.T @ G @ Qa
                 proj = torch.matmul(Q_B.T, grad)
                 proj = torch.matmul(proj, Q_A)
-                # Raw Energy (Unnormalized) to capture magnitude
-                return torch.norm(proj)
+                
+                # --- COSINE SIMILARITY (Normalized) ---
+                # How much of the gradient's energy is inside the subspace?
+                energy_subspace = torch.norm(proj)
+                energy_total = torch.norm(grad)
+                
+                return energy_subspace / (energy_total + 1e-9)
 
-            score_q = get_proj_energy(grad_q, self.layer_subspaces[i]['q'])
-            score_v = get_proj_energy(grad_v, self.layer_subspaces[i]['v'])
+            score_q = get_cosine_similarity(grad_q, self.layer_subspaces[i]['q'])
+            score_v = get_cosine_similarity(grad_v, self.layer_subspaces[i]['v'])
             
-            # Add to total (Weights are already 1.0 for active layers in 'top_5')
+            # Average score for this layer
             total_score += (score_q + score_v) / 2.0
             
-        return total_score.item()
+        # Normalize by number of layers to keep score in [0, 1] range
+        return (total_score / len(self.active_layers)).item()
 
 def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_ids, model_id="roberta-base"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
+    # 1. Load FRESH Base Model (W_0)
+    # Crucial: Use float32 for stable gradient calculation
     print("\n[Attack] Loading Base Model for Gradient Computation...")
     base_model = AutoModelForMaskedLM.from_pretrained(model_id, torch_dtype=torch.float32)
     base_model.to(device)
     base_model.eval()
     
-    # --- CHANGED: Use 'top_5' strategy ---
+    # 2. Initialize Attacker
     attacker = SubspaceProjectionAttack(base_model, model_ft, weighting_strategy="top_5")
     mask_token_id = tokenizer.mask_token_id
     
@@ -147,13 +155,15 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
         for i in tqdm(range(len(dataset)), desc=desc):
             sample = dataset[i]
             
-            # Preprocess
+            # Reconstruct Prompt (Must match training preprocessing exactly)
             prompt = f"{sample['text'][:300]} Topic: {tokenizer.mask_token}"
             target_id = label_ids[sample['label']]
             
+            # Tokenize
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=96).to(device)
             input_ids = inputs["input_ids"]
             
+            # Find mask position
             mask_pos = (input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
             
             if len(mask_pos) == 0:
@@ -162,23 +172,24 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
             
             mask_idx = mask_pos.item()
             
-            # Compute
+            # Compute Gradient Projection Score
             base_model.zero_grad()
             score = attacker.compute_score(input_ids, mask_idx, target_id)
             scores.append(score)
             
         return np.array(scores)
 
+    # 3. Score Datasets
     print("\n[Attack] Scoring Members...")
     scores_in = score_dataset(train_in, "Members")
     
     print("\n[Attack] Scoring Non-Members...")
     scores_out = score_dataset(validation, "Non-Members")
     
-    # Metrics
+    # 4. Diagnostics & Metrics
     print("\n--- DIAGNOSTICS ---")
-    print(f"Members:     Mean={np.mean(scores_in):.4e}, Std={np.std(scores_in):.4e}")
-    print(f"Non-Members: Mean={np.mean(scores_out):.4e}, Std={np.std(scores_out):.4e}")
+    print(f"Members:     Mean={np.mean(scores_in):.4f}, Std={np.std(scores_in):.4f}")
+    print(f"Non-Members: Mean={np.mean(scores_out):.4f}, Std={np.std(scores_out):.4f}")
 
     y_true = [1] * len(scores_in) + [0] * len(scores_out)
     y_scores = np.concatenate([scores_in, scores_out])
@@ -187,11 +198,12 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
     roc_auc = auc(fpr, tpr)
     tpr_at_1 = np.interp(0.01, fpr, tpr)
     
-    print(f"\n>>> SUBSPACE ATTACK RESULTS (Top 5 Layers) <<<")
+    print(f"\n>>> SUBSPACE ATTACK RESULTS (Logit Gradient + Cosine Sim) <<<")
     print(f"AUC:          {roc_auc:.4f}")
     print(f"TPR @ 1% FPR: {tpr_at_1:.4f}")
-    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
     
+    # Cleanup
     del base_model
     del attacker
     torch.cuda.empty_cache()
