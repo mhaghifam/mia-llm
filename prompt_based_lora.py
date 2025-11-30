@@ -22,15 +22,21 @@ def get_data():
     return train_in, validation
 
 def preprocess_data(tokenizer):
-    # Note: We add a space " " because RoBERTa treats " World" differently than "World"
-    # in the middle of a sentence.
-    label_ids = [tokenizer.convert_tokens_to_ids(" " + w) for w in VERBALIZER_WORDS]
+    # --- CORRECTED SECTION ---
+    # We use tokenizer.encode to handle RoBERTa's special "Ġ" character.
+    # We take the first token ID ([0]) from the encoded result.
+    label_ids = [tokenizer.encode(" " + w, add_special_tokens=False)[0] for w in VERBALIZER_WORDS]
+    
+    print(f"Corrected Label IDs: {label_ids}") 
+    # You should see distinct numbers now, e.g., [232, 2824, ...] 
+    # instead of identical numbers.
+    # -------------------------
+
     mask_id = tokenizer.mask_token_id
     
     def preprocess(examples):
         inputs = []
         for text in examples['text']:
-            # Truncate text to fit in memory
             prompt = f"{text[:300]} Topic: {tokenizer.mask_token}"
             inputs.append(prompt)
             
