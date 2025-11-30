@@ -8,6 +8,7 @@ import gc
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc
+from subspace_attack import run_subspace_attack
 
 # Configuration
 MODEL_ID = "roberta-base"
@@ -329,6 +330,19 @@ def main():
     # We pass the trained 'model' (which is the Fine-Tuned one)
     # The attack function will load a FRESH Base Model internally to compare against
     run_attack_evaluation(model, tokenizer, train_in, validation, label_ids)
+
+    ATTACK_SIZE = 1000
+    print(f"\nSubsampling {ATTACK_SIZE} samples for attack evaluation...")
+
+    subset_in = train_in.shuffle(seed=SEED).select(range(ATTACK_SIZE))
+    subset_out = validation.shuffle(seed=SEED).select(range(ATTACK_SIZE))
+
+    # Call the imported function
+    print("\n=== RUNNING OURS: SUBSPACE PROJECTION ATTACK ===")
+    # Note: You might need to pass MODEL_ID if it's not defined in attack.py, 
+    # or ensure attack.py has a default. 
+    # The function signature I gave you uses "roberta-base" by default.
+    run_subspace_attack(model, tokenizer, subset_in, subset_out, label_ids)
 
 if __name__ == "__main__":
     main()
