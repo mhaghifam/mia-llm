@@ -27,9 +27,8 @@ def preprocess_data(tokenizer):
     
     def preprocess(examples):
         inputs = []
-        labels_list = []
         
-        for text, label_idx in zip(examples['text'], examples['label']):
+        for text in examples['text']:
             # Create prompt
             prompt = f"{text[:400]} Topic: {tokenizer.mask_token}"
             inputs.append(prompt)
@@ -38,6 +37,7 @@ def preprocess_data(tokenizer):
         model_inputs = tokenizer(inputs, truncation=True, max_length=128, padding=False)
         
         # Create labels (-100 everywhere except mask position)
+        labels_list = []
         for i, (input_ids, label_idx) in enumerate(zip(model_inputs["input_ids"], examples['label'])):
             labels = [-100] * len(input_ids)
             if mask_id in input_ids:
@@ -55,19 +55,35 @@ class DataCollatorForPromptMLM:
         self.tokenizer = tokenizer
 
     def __call__(self, features):
-        label_list = [feature.pop("labels") for feature in features]
+        # Extract labels and ensure they're lists of ints
+        label_list = []
+        for feature in features:
+            labels = feature.pop("labels", None)
+            # Convert to list if needed
+            if labels is not None:
+                if isinstance(labels, str):
+                    # If it's a string representation, eval it (careful in production!)
+                    labels = eval(labels)
+                elif not isinstance(labels, list):
+                    labels = list(labels)
+                label_list.append(labels)
         
         # Pad inputs
         batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
         
-        # Pad labels
-        max_length = batch["input_ids"].shape[1]
-        padded_labels = []
-        for labels in label_list:
-            padded = labels + [-100] * (max_length - len(labels))
-            padded_labels.append(padded)
+        # Pad labels if they exist
+        if label_list:
+            max_length = batch["input_ids"].shape[1]
+            padded_labels = []
+            for labels in label_list:
+                if len(labels) < max_length:
+                    padded = labels + [-100] * (max_length - len(labels))
+                else:
+                    padded = labels[:max_length]
+                padded_labels.append(padded)
+            
+            batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         
-        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         return batch
 
 def compute_metrics(eval_pred, label_ids):
@@ -101,9 +117,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     preprocess, label_ids = preprocess_data(tokenizer)
     
-    # Tokenize datasets
-    train_dataset = train_in.map(preprocess, batched=True)
-    val_dataset = validation.map(preprocess, batched=True)
+    # Print verbalizer info for debugging
+    print("\nVerbalizer Token IDs:")
+    for word, id in zip(VERBALIZER_WORDS, label_ids):
+        print(f"  {word}: {id}")
+    
+    # Tokenize datasets - set format to ensure proper handling
+    train_dataset = train_in.map(preprocess, batched=True, remove_columns=train_in.column_names)
+    val_dataset = validation.map(preprocess, batched=True, remove_columns=validation.column_names)
+    
+    # Set format to torch to ensure proper tensor handling
+    train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
+    val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
     
     # Load model with LoRA
     base_model = AutoModelForMaskedLM.from_pretrained(MODEL_ID)
