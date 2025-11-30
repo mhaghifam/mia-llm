@@ -86,6 +86,7 @@ class DataCollatorForPromptMLM:
         return batch
 
 def compute_metrics(eval_pred, label_ids):
+    # Logits have been pre-filtered to shape [N, SeqLen, 4]
     logits, labels = eval_pred
     predictions = []
     references = []
@@ -96,13 +97,15 @@ def compute_metrics(eval_pred, label_ids):
             continue
             
         mask_idx = mask_indices[0]
-        token_logits = logits[i, mask_idx, label_ids]
-        predicted = np.argmax(token_logits)
+        
+        # We take all columns because we already filtered for the 4 verbalizers
+        token_logits = logits[i, mask_idx, :] 
+        predicted_idx = np.argmax(token_logits)
         
         true_token_id = labels[i, mask_idx]
         if true_token_id in label_ids:
             true_class = label_ids.index(true_token_id)
-            predictions.append(predicted)
+            predictions.append(predicted_idx)
             references.append(true_class)
     
     accuracy = evaluate.load("accuracy")
@@ -137,7 +140,7 @@ def main():
     base_model = AutoModelForMaskedLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto"  # Automatic device mapping
+        device_map="auto"
     )
     
     # Enable gradient checkpointing for memory efficiency
@@ -146,27 +149,39 @@ def main():
     # Prepare model for LoRA training with memory optimizations
     base_model = prepare_model_for_kbit_training(base_model)
     
-    # LoRA configuration with smaller rank for memory efficiency
+    # LoRA configuration
     peft_config = LoraConfig(
         task_type=TaskType.TOKEN_CLS,
         inference_mode=False,
-        r=4,  # Reduced rank (was 8)
-        lora_alpha=16,  # Reduced alpha (was 32)
+        r=4,
+        lora_alpha=16,
         lora_dropout=0.1,
-        target_modules=["query", "value"],  # Fewer target modules
-        bias="none"  # Don't train biases
+        target_modules=["query", "value"],
+        bias="none"
     )
     
     model = get_peft_model(base_model, peft_config)
     model.print_trainable_parameters()
+
+    # --- NEW: Function to reduce logit size before caching ---
+    def preprocess_logits_for_metrics(logits, labels):
+        """
+        Extracts only the logits for the verbalizer words to save memory.
+        Returns tensor of shape [Batch, Seq, 4] instead of [Batch, Seq, 50265]
+        """
+        if isinstance(logits, tuple):
+            logits = logits[1]
+        
+        # Select only the columns corresponding to our Verbalizer words
+        return logits[:, :, label_ids]
     
     # Setup memory-efficient training arguments
     training_args = TrainingArguments(
         output_dir="./lora-prompt",
-        learning_rate=2e-4,  # Slightly higher LR for smaller batches
-        per_device_train_batch_size=4,  # Very small batch size
+        learning_rate=2e-4,
+        per_device_train_batch_size=4,
         per_device_eval_batch_size=8,
-        gradient_accumulation_steps=8,  # Effective batch size = 32
+        gradient_accumulation_steps=8,
         num_train_epochs=3,
         weight_decay=0.01,
         save_strategy="no",
@@ -174,12 +189,14 @@ def main():
         report_to="none",
         remove_unused_columns=False,
         warmup_ratio=0.1,
-        fp16=torch.cuda.is_available(),  # Mixed precision training
-        optim="adamw_8bit" if torch.cuda.is_available() else "adamw",  # 8-bit Adam
-        gradient_checkpointing=True,  # Enable gradient checkpointing
-        max_grad_norm=1.0,  # Gradient clipping
-        dataloader_pin_memory=False,  # Reduce memory pinning
-        dataloader_num_workers=0,  # Reduce memory from workers
+        fp16=torch.cuda.is_available(),
+        optim="adamw_8bit" if torch.cuda.is_available() else "adamw",
+        gradient_checkpointing=True,
+        max_grad_norm=1.0,
+        dataloader_pin_memory=False,
+        dataloader_num_workers=0,
+        # --- NEW: Aggressive offloading ---
+        eval_accumulation_steps=1, # Offload predictions to CPU immediately
     )
     
     trainer = Trainer(
@@ -189,10 +206,11 @@ def main():
         eval_dataset=val_dataset,
         tokenizer=tokenizer,
         data_collator=DataCollatorForPromptMLM(tokenizer),
-        compute_metrics=lambda x: compute_metrics(x, label_ids)
+        compute_metrics=lambda x: compute_metrics(x, label_ids),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics, # <--- REGISTER PREPROCESSOR
     )
     
-    # Evaluate before training (with memory cleanup)
+    # Evaluate before training
     print("\n=== BEFORE TRAINING ===")
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
     train_metrics_before = trainer.evaluate(eval_dataset=train_dataset)
