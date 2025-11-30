@@ -21,7 +21,7 @@ def get_data():
     dataset = load_dataset("ag_news")
     full_train = dataset["train"].shuffle(seed=SEED)
     # Using a subset for faster debugging/training
-    train_in = full_train.select(range(0, 2000))
+    train_in = full_train.select(range(0, 1000))
     validation = dataset["test"]
     return train_in, validation
 
