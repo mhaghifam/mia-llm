@@ -147,7 +147,7 @@ def main():
     base_model = prepare_model_for_kbit_training(base_model)
     
     peft_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS, inference_mode=False, r=4, lora_alpha=16,
+        task_type=TaskType.TOKEN_CLS, inference_mode=False, r=8, lora_alpha=16,
         lora_dropout=0.1, target_modules=["query", "value"], bias="none"
     )
     
@@ -166,7 +166,7 @@ def main():
         per_device_train_batch_size=4,
         per_device_eval_batch_size=8,
         gradient_accumulation_steps=8,
-        num_train_epochs=3,
+        num_train_epochs=5,
         weight_decay=0.01,
         save_strategy="no",
         logging_steps=50,
