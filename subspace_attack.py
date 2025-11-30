@@ -5,9 +5,15 @@ from sklearn.metrics import roc_curve, auc
 from transformers import AutoModelForMaskedLM
 
 class SubspaceProjectionAttack:
-    def __init__(self, base_model, lora_model, weighting_strategy="linear"):
+    def __init__(self, base_model, lora_model, weighting_strategy="top_5"):
         """
-        Implements the Subspace Projection Attack targeting Logit Gradients.
+        Implements the Subspace Projection Attack with Layer Selection.
+        
+        Args:
+            weighting_strategy: 
+                - 'linear': Weights layers 1..12 increasingly.
+                - 'top_5': Only looks at the last 5 layers (Average).
+                - 'last': Only looks at the very last layer.
         """
         self.base_model = base_model
         self.device = base_model.device
@@ -15,29 +21,26 @@ class SubspaceProjectionAttack:
         self.weights = {}         
         self.target_layer_indices = []
         
-        print("Initializing Subspace Attack: Decomposing Adapters...")
+        print(f"Initializing Subspace Attack (Strategy: {weighting_strategy})...")
         
-        # 1. Identify Architecture & Layers (RoBERTa specific)
+        # 1. Identify Architecture
         if hasattr(lora_model.base_model, "roberta"):
             encoder = lora_model.base_model.roberta.encoder
         elif hasattr(lora_model, "roberta"):
             encoder = lora_model.roberta.encoder
         else:
-            # Fallback/Generic
             encoder = lora_model.base_model.model.encoder
             
         num_layers = len(encoder.layer)
 
-        # 2. Extract Subspaces (Q_B, Q_A) for every layer
+        # 2. Extract Subspaces
         for i in range(num_layers):
             try:
-                # Path to attention weights in RoBERTa
                 peft_layer_q = encoder.layer[i].attention.self.query
                 peft_layer_v = encoder.layer[i].attention.self.value
             except AttributeError:
                 continue
 
-            # Check if LoRA is active on this layer
             if hasattr(peft_layer_q, "lora_A") and hasattr(peft_layer_v, "lora_A"):
                 self.target_layer_indices.append(i)
                 self.layer_subspaces[i] = {
@@ -45,58 +48,69 @@ class SubspaceProjectionAttack:
                     'v': self._get_qr(peft_layer_v)
                 }
         
-        # 3. Setup Layer Weights
+        # 3. Setup Weights & Active Layers
         self._setup_weights(weighting_strategy)
-        print(f"Attack initialized on {len(self.target_layer_indices)} layers.")
+        
+        # Identify which layers actually need gradient computation (optimization)
+        self.active_layers = [i for i in self.target_layer_indices if self.weights[i] > 0]
+        print(f"Active Layers for Gradient Computation: {self.active_layers}")
 
     def _get_qr(self, lora_layer):
-        # Extract LoRA weights: W_delta = B @ A
         A = lora_layer.lora_A.default.weight.detach().float()
         B = lora_layer.lora_B.default.weight.detach().float()
         
-        # QR Decomposition
-        # Q_B spans the Error space (Columns of B)
-        # Q_A spans the Activation space (Rows of A -> Columns of A.T)
         Q_B, _ = torch.linalg.qr(B)   
         Q_A, _ = torch.linalg.qr(A.T) 
-        
         return Q_B.to(self.device), Q_A.to(self.device)
 
     def _setup_weights(self, strategy):
+        # Reset
         for i in self.target_layer_indices:
-            if strategy == "linear":
-                self.weights[i] = (i + 1) # Layer 12 gets 12x weight of Layer 1
-            else:
+            self.weights[i] = 0.0
+            
+        if strategy == "top_5":
+            # Select the last 5 indices
+            top_indices = sorted(self.target_layer_indices)[-5:]
+            for i in top_indices:
+                self.weights[i] = 1.0 # Simple Average
+                
+        elif strategy == "last":
+            last_idx = max(self.target_layer_indices)
+            self.weights[last_idx] = 1.0
+            
+        elif strategy == "linear":
+            for i in self.target_layer_indices:
+                self.weights[i] = (i + 1)
+                
+        else: # Default to equal
+            for i in self.target_layer_indices:
                 self.weights[i] = 1.0
 
     def compute_score(self, input_ids, mask_idx, target_token_id):
-        """
-        Computes score using gradient of the TARGET LOGIT (not Loss).
-        """
-        # 1. Enable Gradients on specific Base Model weights
+        # 1. Enable Gradients ONLY for Active Layers (Optimization)
         target_params = []
-        for i in self.target_layer_indices:
+        # We iterate only through the layers we care about
+        for i in self.active_layers:
             layer = self.base_model.roberta.encoder.layer[i].attention.self
             target_params.append(layer.query.weight)
             target_params.append(layer.value.weight)
             
         # 2. Forward Pass
-        # We need gradients, so we allow grad accumulation
         outputs = self.base_model(input_ids=input_ids)
         
-        # --- CRITICAL CHANGE: TARGET THE LOGIT DIRECTLY ---
-        # We compute gradient of the score for the correct verbalizer.
-        # This vector represents "The features that increase probability of this class".
+        # Target Logit (Not Loss)
         target_logit = outputs.logits[0, mask_idx, target_token_id]
         
         # 3. Compute Gradients
+        # This will only backprop up to the earliest active layer, saving time
         grads = torch.autograd.grad(target_logit, target_params, retain_graph=False, create_graph=False)
         
         # 4. Project and Score
         total_score = 0.0
         grad_iter = iter(grads)
         
-        for i in self.target_layer_indices:
+        for i in self.active_layers:
+            # Gradients come in pairs (Query, Value)
             grad_q = next(grad_iter)
             grad_v = next(grad_iter)
             
@@ -105,32 +119,27 @@ class SubspaceProjectionAttack:
                 # Project: P = Qb.T @ G @ Qa
                 proj = torch.matmul(Q_B.T, grad)
                 proj = torch.matmul(proj, Q_A)
-                
-                # --- RAW ENERGY (Unnormalized) ---
-                # We want the magnitude of alignment. 
-                # Stronger "feature strength" in the subspace = Member.
+                # Raw Energy (Unnormalized) to capture magnitude
                 return torch.norm(proj)
 
             score_q = get_proj_energy(grad_q, self.layer_subspaces[i]['q'])
             score_v = get_proj_energy(grad_v, self.layer_subspaces[i]['v'])
             
-            # Weighted average for this layer
-            total_score += ((score_q + score_v) / 2.0) * self.weights[i]
+            # Add to total (Weights are already 1.0 for active layers in 'top_5')
+            total_score += (score_q + score_v) / 2.0
             
         return total_score.item()
 
 def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_ids, model_id="roberta-base"):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 1. Load FRESH Base Model (W_0)
-    # Crucial: Use float32 for stable gradient calculation
     print("\n[Attack] Loading Base Model for Gradient Computation...")
     base_model = AutoModelForMaskedLM.from_pretrained(model_id, torch_dtype=torch.float32)
     base_model.to(device)
     base_model.eval()
     
-    # 2. Initialize Attacker
-    attacker = SubspaceProjectionAttack(base_model, model_ft, weighting_strategy="linear")
+    # --- CHANGED: Use 'top_5' strategy ---
+    attacker = SubspaceProjectionAttack(base_model, model_ft, weighting_strategy="top_5")
     mask_token_id = tokenizer.mask_token_id
     
     def score_dataset(dataset, desc):
@@ -138,15 +147,13 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
         for i in tqdm(range(len(dataset)), desc=desc):
             sample = dataset[i]
             
-            # Preprocess (Same as training)
+            # Preprocess
             prompt = f"{sample['text'][:300]} Topic: {tokenizer.mask_token}"
             target_id = label_ids[sample['label']]
             
-            # Tokenize
             inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=96).to(device)
             input_ids = inputs["input_ids"]
             
-            # Find mask position
             mask_pos = (input_ids[0] == mask_token_id).nonzero(as_tuple=True)[0]
             
             if len(mask_pos) == 0:
@@ -155,27 +162,24 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
             
             mask_idx = mask_pos.item()
             
-            # Compute Gradient Projection Score
+            # Compute
             base_model.zero_grad()
-            # Pass indices instead of labels tensor
             score = attacker.compute_score(input_ids, mask_idx, target_id)
             scores.append(score)
             
         return np.array(scores)
 
-    # 3. Score Datasets
     print("\n[Attack] Scoring Members...")
     scores_in = score_dataset(train_in, "Members")
     
     print("\n[Attack] Scoring Non-Members...")
     scores_out = score_dataset(validation, "Non-Members")
     
-    # 4. Diagnostics
+    # Metrics
     print("\n--- DIAGNOSTICS ---")
     print(f"Members:     Mean={np.mean(scores_in):.4e}, Std={np.std(scores_in):.4e}")
     print(f"Non-Members: Mean={np.mean(scores_out):.4e}, Std={np.std(scores_out):.4e}")
 
-    # 5. Calculate Metrics
     y_true = [1] * len(scores_in) + [0] * len(scores_out)
     y_scores = np.concatenate([scores_in, scores_out])
     
@@ -183,10 +187,10 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
     roc_auc = auc(fpr, tpr)
     tpr_at_1 = np.interp(0.01, fpr, tpr)
     
-    print(f"\n>>> SUBSPACE ATTACK RESULTS <<<")
+    print(f"\n>>> SUBSPACE ATTACK RESULTS (Top 5 Layers) <<<")
     print(f"AUC:          {roc_auc:.4f}")
     print(f"TPR @ 1% FPR: {tpr_at_1:.4f}")
-    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
     
     del base_model
     del attacker
