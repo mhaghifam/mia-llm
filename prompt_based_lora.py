@@ -16,17 +16,21 @@ VERBALIZER_WORDS = ["World", "Sports", "Business", "Technology"]
 def get_data():
     dataset = load_dataset("ag_news")
     full_train = dataset["train"].shuffle(seed=SEED)
+    # Using a subset for faster debugging/training
     train_in = full_train.select(range(0, 2000))
     validation = dataset["test"]
     return train_in, validation
 
 def preprocess_data(tokenizer):
+    # Note: We add a space " " because RoBERTa treats " World" differently than "World"
+    # in the middle of a sentence.
     label_ids = [tokenizer.convert_tokens_to_ids(" " + w) for w in VERBALIZER_WORDS]
     mask_id = tokenizer.mask_token_id
     
     def preprocess(examples):
         inputs = []
         for text in examples['text']:
+            # Truncate text to fit in memory
             prompt = f"{text[:300]} Topic: {tokenizer.mask_token}"
             inputs.append(prompt)
             
@@ -72,8 +76,13 @@ class DataCollatorForPromptMLM:
             batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         return batch
 
-# UPDATED: Handles filtered logits (only 4 columns)
+# Global counter for debug printing
+debug_print_limit = 5
+debug_print_counter = 0
+
 def compute_metrics(eval_pred, label_ids):
+    global debug_print_counter
+    
     logits, labels = eval_pred
     predictions = []
     references = []
@@ -84,8 +93,7 @@ def compute_metrics(eval_pred, label_ids):
             
         mask_idx = mask_indices[0]
         
-        # Logits are already filtered to [4] columns.
-        # Index 0 = First Verbalizer, Index 1 = Second Verbalizer, etc.
+        # Logits are filtered to [4] columns: [World, Sports, Business, Technology]
         token_logits = logits[i, mask_idx, :] 
         predicted_idx = np.argmax(token_logits)
         
@@ -94,7 +102,16 @@ def compute_metrics(eval_pred, label_ids):
             true_class = label_ids.index(true_token_id)
             predictions.append(predicted_idx)
             references.append(true_class)
-    
+            
+            # --- DEBUG: Print the first few predictions to see why accuracy is 1.0 ---
+            if debug_print_counter < debug_print_limit:
+                print(f"\n[DEBUG] Example {debug_print_counter + 1}:")
+                print(f"  Logits (World, Spts, Biz, Tech): {token_logits}")
+                print(f"  Predicted Class: {VERBALIZER_WORDS[predicted_idx]} (Index {predicted_idx})")
+                print(f"  True Class:      {VERBALIZER_WORDS[true_class]} (Index {true_class})")
+                debug_print_counter += 1
+            # -------------------------------------------------------------------------
+
     accuracy = evaluate.load("accuracy")
     return accuracy.compute(predictions=predictions, references=references)
 
@@ -106,6 +123,8 @@ def main():
     train_in, validation = get_data()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     preprocess, label_ids = preprocess_data(tokenizer)
+    
+    print("\nVerbalizer Token IDs:", label_ids)
     
     train_dataset = train_in.map(preprocess, batched=True, remove_columns=train_in.column_names)
     val_dataset = validation.map(preprocess, batched=True, remove_columns=validation.column_names)
@@ -129,13 +148,12 @@ def main():
     model = get_peft_model(base_model, peft_config)
     model.print_trainable_parameters()
 
-    # --- CRITICAL FIX: Filter logits before storing ---
+    # --- MEMORY FIX: Filter logits before storing ---
     def preprocess_logits_for_metrics(logits, labels):
         if isinstance(logits, tuple): logits = logits[1]
-        # Keep ONLY the columns for the verbalizer words
+        # Only keep the 4 columns we care about
         return logits[:, :, label_ids]
-    # --------------------------------------------------
-
+    
     training_args = TrainingArguments(
         output_dir="./lora-prompt",
         learning_rate=2e-4,
@@ -150,7 +168,8 @@ def main():
         remove_unused_columns=False,
         warmup_ratio=0.1,
         fp16=torch.cuda.is_available(),
-        optim="adamw_8bit" if torch.cuda.is_available() else "adamw",
+        # CHANGED: Use adamw_torch to fix 'bitsandbytes' error
+        optim="adamw_torch",
         gradient_checkpointing=True,
     )
     
@@ -162,13 +181,22 @@ def main():
         tokenizer=tokenizer,
         data_collator=DataCollatorForPromptMLM(tokenizer),
         compute_metrics=lambda x: compute_metrics(x, label_ids),
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics, # <--- Apply Fix
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
     
+    # --- EVALUATION ---
     print("\n=== BEFORE TRAINING ===")
+    # We reset the debug counter so we see examples from both sets
+    global debug_print_counter
+    debug_print_counter = 0
+    
+    # Evaluate Train
     train_metrics_before = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_before['eval_accuracy']:.4f}")
     
+    debug_print_counter = 0 # Reset for Validation
+    
+    # Evaluate Validation
     val_metrics_before = trainer.evaluate(eval_dataset=val_dataset)
     print(f"Validation Accuracy: {val_metrics_before['eval_accuracy']:.4f}")
     
@@ -176,6 +204,7 @@ def main():
     trainer.train()
     
     print("\n=== AFTER TRAINING ===")
+    debug_print_counter = 0 # Reset for final eval
     train_metrics_after = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_after['eval_accuracy']:.4f}")
     
