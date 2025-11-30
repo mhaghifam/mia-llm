@@ -5,6 +5,9 @@ from transformers import AutoTokenizer, AutoModelForMaskedLM, TrainingArguments,
 from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
 import evaluate
 import gc
+import torch.nn.functional as F
+from tqdm import tqdm
+from sklearn.metrics import roc_curve, auc
 
 # Configuration
 MODEL_ID = "roberta-base"
@@ -22,15 +25,11 @@ def get_data():
     return train_in, validation
 
 def preprocess_data(tokenizer):
-    # --- CORRECTED SECTION ---
     # We use tokenizer.encode to handle RoBERTa's special "Ġ" character.
     # We take the first token ID ([0]) from the encoded result.
     label_ids = [tokenizer.encode(" " + w, add_special_tokens=False)[0] for w in VERBALIZER_WORDS]
     
-    print(f"Corrected Label IDs: {label_ids}") 
-    # You should see distinct numbers now, e.g., [232, 2824, ...] 
-    # instead of identical numbers.
-    # -------------------------
+    print(f"Verbalizer Label IDs: {label_ids}") 
 
     mask_id = tokenizer.mask_token_id
     
@@ -109,17 +108,130 @@ def compute_metrics(eval_pred, label_ids):
             predictions.append(predicted_idx)
             references.append(true_class)
             
-            # --- DEBUG: Print the first few predictions to see why accuracy is 1.0 ---
             if debug_print_counter < debug_print_limit:
                 print(f"\n[DEBUG] Example {debug_print_counter + 1}:")
                 print(f"  Logits (World, Spts, Biz, Tech): {token_logits}")
                 print(f"  Predicted Class: {VERBALIZER_WORDS[predicted_idx]} (Index {predicted_idx})")
                 print(f"  True Class:      {VERBALIZER_WORDS[true_class]} (Index {true_class})")
                 debug_print_counter += 1
-            # -------------------------------------------------------------------------
 
     accuracy = evaluate.load("accuracy")
     return accuracy.compute(predictions=predictions, references=references)
+
+# ==========================================
+# ATTACK IMPLEMENTATION START
+# ==========================================
+
+def compute_calibrated_loss_scores(
+    model_ft, 
+    model_base, 
+    dataset, 
+    tokenizer, 
+    label_ids, 
+    device="cuda"
+):
+    """
+    Computes calibrated score: log P_FT(y|x) - log P_Base(y|x)
+    Equivalent to: Base_Loss - FT_Loss
+    """
+    model_ft.eval()
+    model_base.eval()
+    scores = []
+    
+    mask_token_id = tokenizer.mask_token_id
+    
+    print(f"Computing scores for {len(dataset)} samples...")
+    
+    with torch.no_grad():
+        for i in tqdm(range(len(dataset))):
+            sample = dataset[i]
+            text = sample['text']
+            label_idx = sample['label']
+            
+            # --- 1. Replicate Training Preprocessing EXACTLY ---
+            # We must construct the prompt exactly as training did
+            # Truncate text to 300 chars then add prompt
+            prompt = f"{text[:300]} Topic: {tokenizer.mask_token}"
+            target_token_id = label_ids[label_idx]
+            
+            # Tokenize with same max_length (96) and truncation
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=96)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # Find mask index
+            input_ids = inputs["input_ids"][0]
+            mask_positions = (input_ids == mask_token_id).nonzero(as_tuple=True)[0]
+            
+            # Safety check: if truncation cut off the mask, skip this sample
+            if len(mask_positions) == 0:
+                # Neutral score (0.0) means no information gained
+                scores.append(0.0)
+                continue
+            
+            mask_idx = mask_positions.item()
+            
+            # --- 2. Forward Pass (Both Models) ---
+            logits_ft = model_ft(**inputs).logits[0, mask_idx, :]
+            logits_base = model_base(**inputs).logits[0, mask_idx, :]
+            
+            # --- 3. Compute Log Probabilities ---
+            # We want log P(y | x)
+            # Optimization: Calculate log_softmax only for the target token ID
+            # log_softmax(x)_i = x_i - log(sum(exp(x)))
+            
+            log_prob_ft = logits_ft[target_token_id] - torch.logsumexp(logits_ft, dim=0)
+            log_prob_base = logits_base[target_token_id] - torch.logsumexp(logits_base, dim=0)
+            
+            # --- 4. Calibrated Score ---
+            # If FT model is MORE confident than Base model, score is Positive -> Member
+            score = (log_prob_ft - log_prob_base).item()
+            scores.append(score)
+            
+    return np.array(scores)
+
+def run_attack_evaluation(model_ft, tokenizer, train_in, validation, label_ids):
+    """
+    Runs the full attack: Load Base Model, Compute Scores, Calculate AUC/TPR.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # 1. Load Base Model (The Reference)
+    print("\nLoading Base Model for Calibration...")
+    model_base = AutoModelForMaskedLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="auto"
+    )
+    
+    # 2. Compute Scores
+    print("\n--- Scoring MEMBERS (Train In) ---")
+    member_scores = compute_calibrated_loss_scores(model_ft, model_base, train_in, tokenizer, label_ids, device)
+    
+    print("\n--- Scoring NON-MEMBERS (Validation) ---")
+    # Note: In a rigorous paper, 'validation' should be 'train_out' (unseen data from same distribution)
+    # Using official validation set is a standard proxy for a quick test.
+    non_member_scores = compute_calibrated_loss_scores(model_ft, model_base, validation, tokenizer, label_ids, device)
+    
+    # 3. Calculate Metrics
+    y_true = [1] * len(member_scores) + [0] * len(non_member_scores)
+    y_scores = np.concatenate([member_scores, non_member_scores])
+    
+    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+    roc_auc = auc(fpr, tpr)
+    
+    # Interpolate to find TPR at exactly 1% FPR
+    tpr_at_1_fpr = np.interp(0.01, fpr, tpr)
+    
+    print(f"\n========================================")
+    print(f"   ATTACK RESULTS (Calibrated Loss)    ")
+    print(f"========================================")
+    print(f"AUC:          {roc_auc:.4f}")
+    print(f"TPR @ 1% FPR: {tpr_at_1_fpr:.4f}")
+    print(f"========================================")
+
+# ==========================================
+# ATTACK IMPLEMENTATION END
+# ==========================================
 
 def main():
     if torch.cuda.is_available():
@@ -154,18 +266,17 @@ def main():
     model = get_peft_model(base_model, peft_config)
     model.print_trainable_parameters()
 
-    # --- MEMORY FIX: Filter logits before storing ---
     def preprocess_logits_for_metrics(logits, labels):
         if isinstance(logits, tuple): logits = logits[1]
-        # Only keep the 4 columns we care about
+        # Only keep the 4 columns we care about to save memory
         return logits[:, :, label_ids]
     
     training_args = TrainingArguments(
         output_dir="./lora-prompt",
         learning_rate=2e-4,
-        per_device_train_batch_size=4,
-        per_device_eval_batch_size=8,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=32, # Increased batch size for speed (reduce if OOM)
+        per_device_eval_batch_size=64,
+        gradient_accumulation_steps=1,
         num_train_epochs=5,
         weight_decay=0.01,
         save_strategy="no",
@@ -174,9 +285,8 @@ def main():
         remove_unused_columns=False,
         warmup_ratio=0.1,
         fp16=torch.cuda.is_available(),
-        # CHANGED: Use adamw_torch to fix 'bitsandbytes' error
         optim="adamw_torch",
-        gradient_checkpointing=True,
+        gradient_checkpointing=False, # Disable GC for speed if memory allows
     )
     
     trainer = Trainer(
@@ -192,17 +302,13 @@ def main():
     
     # --- EVALUATION ---
     print("\n=== BEFORE TRAINING ===")
-    # We reset the debug counter so we see examples from both sets
     global debug_print_counter
     debug_print_counter = 0
     
-    # Evaluate Train
     train_metrics_before = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_before['eval_accuracy']:.4f}")
     
-    debug_print_counter = 0 # Reset for Validation
-    
-    # Evaluate Validation
+    debug_print_counter = 0 
     val_metrics_before = trainer.evaluate(eval_dataset=val_dataset)
     print(f"Validation Accuracy: {val_metrics_before['eval_accuracy']:.4f}")
     
@@ -210,7 +316,7 @@ def main():
     trainer.train()
     
     print("\n=== AFTER TRAINING ===")
-    debug_print_counter = 0 # Reset for final eval
+    debug_print_counter = 0 
     train_metrics_after = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_after['eval_accuracy']:.4f}")
     
@@ -218,6 +324,11 @@ def main():
     print(f"Validation Accuracy: {val_metrics_after['eval_accuracy']:.4f}")
     
     trainer.save_model("./final-model")
+    
+    # --- RUN THE ATTACK ---
+    # We pass the trained 'model' (which is the Fine-Tuned one)
+    # The attack function will load a FRESH Base Model internally to compare against
+    run_attack_evaluation(model, tokenizer, train_in, validation, label_ids)
 
 if __name__ == "__main__":
     main()
