@@ -124,6 +124,10 @@ class SpectralIntruderAttack:
         return torch.stack(intruders, dim=1).to(self.device)
 
     def compute_score(self, input_ids, mask_idx, target_token_id):
+        # If no intruder dimensions were found, fall back to 0
+        if not self.active_layers:
+            return 0.0
+
         # 1. Force Gradients on Frozen Weights
         # LoRA freezes base weights, so autograd usually ignores them.
         # We must manually set requires_grad=True for this pass.
@@ -139,6 +143,10 @@ class SpectralIntruderAttack:
             
             target_params.append(layer.query.weight)
             target_params.append(layer.value.weight)
+
+        # No parameters collected: return neutral score
+        if not target_params:
+            return 0.0
             
         # 2. Forward Pass with Gradients Enabled
         # Even if in eval mode, we need gradient tracking

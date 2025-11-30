@@ -227,7 +227,9 @@ def main():
         return ex
     
     print("\n!!! SANITY CHECK: SCRAMBLING LABELS TO FORCE MEMORIZATION !!!")
-    train_in = train_in.map(scramble_labels)
+    train_in = train_in.map(scramble_labels, load_from_cache_file=False)
+    # Keep validation clean for accuracy reporting; make a scrambled copy for attack scoring
+    validation_for_attack = validation.map(scramble_labels, load_from_cache_file=False)
     # -------------------------------------------------
     
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -323,7 +325,7 @@ def main():
 
     # Train in is already subsampled, shuffle to be safe
     subset_in = train_in.shuffle(seed=SEED).select(range(ATTACK_SIZE)) if len(train_in) > ATTACK_SIZE else train_in
-    subset_out = validation.shuffle(seed=SEED).select(range(ATTACK_SIZE))
+    subset_out = validation_for_attack.shuffle(seed=SEED).select(range(ATTACK_SIZE))
 
     print("\n=== RUNNING BASELINE: CALIBRATED LOSS ATTACK ===")
     run_attack_evaluation(model, tokenizer, subset_in, subset_out, label_ids)
