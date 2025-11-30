@@ -5,7 +5,7 @@ from sklearn.metrics import roc_curve, auc
 from transformers import AutoModelForMaskedLM
 
 class SpectralIntruderAttack:
-    def __init__(self, base_model, lora_model, threshold=0.1, top_k_base=768):
+    def __init__(self, base_model, lora_model, threshold=0.1, top_k_base=64):
         """
         Implements the Spectral Intruder Attack.
         
@@ -189,7 +189,7 @@ class SpectralIntruderAttack:
         if valid_counts == 0: return 0.0
         return (total_score / valid_counts).item()
 
-def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_ids, threshold=0.1):
+def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_ids, threshold=0.1, top_k_base=64):
     # Use the fine-tuned model device for scoring; keep base on CPU for SVD
     device = next(model_ft.parameters()).device
     
@@ -197,7 +197,7 @@ def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_id
     base_model = AutoModelForMaskedLM.from_pretrained("roberta-base", torch_dtype=torch.float32).to("cpu")
     base_model.eval()
     
-    attacker = SpectralIntruderAttack(base_model, model_ft, threshold=threshold)
+    attacker = SpectralIntruderAttack(base_model, model_ft, threshold=threshold, top_k_base=top_k_base)
     
     mask_token_id = tokenizer.mask_token_id
     

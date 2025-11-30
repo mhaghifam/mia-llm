@@ -334,7 +334,8 @@ def main():
     evaluate_subspace_attack(model, tokenizer, subset_in, subset_out, label_ids)
 
     print("\n=== RUNNING OURS: intruder ATTACK ===")
-    evaluate_intruder_attack(model, tokenizer, subset_in, subset_out, label_ids)
+    # Use looser threshold and smaller base subspace to avoid empty intruder sets
+    evaluate_intruder_attack(model, tokenizer, subset_in, subset_out, label_ids, threshold=0.3, top_k_base=64)
 
 if __name__ == "__main__":
     main()
