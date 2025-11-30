@@ -2,22 +2,22 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc
-from transformers import AutoModelForMaskedLM
 
 class SubspaceProjectionAttack:
-    def __init__(self, base_model, lora_model, weighting_strategy="top_5"):
+    def __init__(self, lora_model, weighting_strategy="top_5"):
         """
-        Implements the Subspace Projection Attack using Logit Gradients and Cosine Similarity.
+        Implements the Subspace Projection Attack using logit gradients and cosine similarity.
+        Gradients are taken w.r.t. the *fine-tuned* (LoRA) model.
         """
-        self.base_model = base_model
-        self.device = base_model.device
-        self.layer_subspaces = {} 
-        self.weights = {}         
+        self.model = lora_model
+        self.device = lora_model.device
+        self.layer_subspaces = {}
+        self.weights = {}
         self.target_layer_indices = []
-        
+
         print(f"Initializing Subspace Attack (Strategy: {weighting_strategy})...")
-        
-        # 1. Identify Architecture & Layers
+
+        # 1. Identify architecture & layers on the fine-tuned model
         if hasattr(lora_model.base_model, "roberta"):
             encoder = lora_model.base_model.roberta.encoder
         elif hasattr(lora_model, "roberta"):
@@ -25,10 +25,10 @@ class SubspaceProjectionAttack:
         else:
             # Fallback for generic HF models
             encoder = lora_model.base_model.model.encoder
-            
+
         num_layers = len(encoder.layer)
 
-        # 2. Extract Subspaces (Q_B, Q_A) for every layer
+        # 2. Extract subspaces (Q_B, Q_A) for every layer
         for i in range(num_layers):
             try:
                 peft_layer_q = encoder.layer[i].attention.self.query
@@ -43,10 +43,10 @@ class SubspaceProjectionAttack:
                     'q': self._get_qr(peft_layer_q),
                     'v': self._get_qr(peft_layer_v)
                 }
-        
-        # 3. Setup Layer Weights & Active Layers
+
+        # 3. Setup layer weights & active layers
         self._setup_weights(weighting_strategy)
-        
+
         # Optimization: Only track layers with non-zero weight
         self.active_layers = [i for i in self.target_layer_indices if self.weights[i] > 0]
         print(f"Active Layers for Gradient Computation: {self.active_layers}")
@@ -90,13 +90,13 @@ class SubspaceProjectionAttack:
         # 1. Enable Gradients ONLY on Active Layers
         target_params = []
         for i in self.active_layers:
-            layer = self.base_model.roberta.encoder.layer[i].attention.self
+            layer = self.model.roberta.encoder.layer[i].attention.self
             target_params.append(layer.query.weight)
             target_params.append(layer.value.weight)
             
         # 2. Forward Pass
         # We need gradients, so we allow grad accumulation
-        outputs = self.base_model(input_ids=input_ids)
+        outputs = self.model(input_ids=input_ids)
         
         # --- CRITICAL: Target the Logit, NOT the Loss ---
         # We want the gradient vector that pushes this class score UP.
@@ -136,21 +136,18 @@ class SubspaceProjectionAttack:
         # Normalize by number of layers to keep score in [0, 1] range
         return (total_score / len(self.active_layers)).item()
 
-def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_ids, model_id="roberta-base"):
+def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_ids):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # 1. Load FRESH Base Model (W_0)
-    # Crucial: Use float32 for stable gradient calculation
-    print("\n[Attack] Loading Base Model for Gradient Computation...")
-    base_model = AutoModelForMaskedLM.from_pretrained(model_id, torch_dtype=torch.float32)
-    base_model.to(device)
-    base_model.eval()
-    
+
+    print("\n[Attack] Using fine-tuned model for gradient computation...")
+    model_ft.to(device)
+    model_ft.eval()
+
     # 2. Initialize Attacker
-    attacker = SubspaceProjectionAttack(base_model, model_ft, weighting_strategy="top_5")
+    attacker = SubspaceProjectionAttack(model_ft, weighting_strategy="top_5")
     mask_token_id = tokenizer.mask_token_id
     
-    def score_dataset(dataset, desc):
+    def score_dataset(dataset, desc, attacker_obj):
         scores = []
         for i in tqdm(range(len(dataset)), desc=desc):
             sample = dataset[i]
@@ -173,18 +170,18 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
             mask_idx = mask_pos.item()
             
             # Compute Gradient Projection Score
-            base_model.zero_grad()
-            score = attacker.compute_score(input_ids, mask_idx, target_id)
+            attacker_obj.model.zero_grad()
+            score = attacker_obj.compute_score(input_ids, mask_idx, target_id)
             scores.append(score)
             
         return np.array(scores)
 
     # 3. Score Datasets
     print("\n[Attack] Scoring Members...")
-    scores_in = score_dataset(train_in, "Members")
+    scores_in = score_dataset(train_in, "Members", attacker)
     
     print("\n[Attack] Scoring Non-Members...")
-    scores_out = score_dataset(validation, "Non-Members")
+    scores_out = score_dataset(validation, "Non-Members", attacker)
     
     # 4. Diagnostics & Metrics
     print("\n--- DIAGNOSTICS ---")
@@ -198,13 +195,12 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
     roc_auc = auc(fpr, tpr)
     tpr_at_1 = np.interp(0.01, fpr, tpr)
     
-    print(f"\n>>> SUBSPACE ATTACK RESULTS (Logit Gradient + Cosine Sim) <<<")
+    print("\n>>> SUBSPACE ATTACK RESULTS (Logit Gradient + Cosine Sim) <<<")
     print(f"AUC:          {roc_auc:.4f}")
     print(f"TPR @ 1% FPR: {tpr_at_1:.4f}")
-    print(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
+    print(">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
     
     # Cleanup
-    del base_model
     del attacker
     torch.cuda.empty_cache()
     
