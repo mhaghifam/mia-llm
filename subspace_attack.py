@@ -91,12 +91,16 @@ class SubspaceProjectionAttack:
         target_params = []
         for i in self.active_layers:
             layer = self.model.roberta.encoder.layer[i].attention.self
+            # LoRA freezes base weights; we still want grads for scoring.
+            layer.query.weight.requires_grad_(True)
+            layer.value.weight.requires_grad_(True)
             target_params.append(layer.query.weight)
             target_params.append(layer.value.weight)
             
         # 2. Forward Pass
         # We need gradients, so we allow grad accumulation
-        outputs = self.model(input_ids=input_ids)
+        with torch.enable_grad():
+            outputs = self.model(input_ids=input_ids)
         
         # --- CRITICAL: Target the Logit, NOT the Loss ---
         # We want the gradient vector that pushes this class score UP.
