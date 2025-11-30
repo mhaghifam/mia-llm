@@ -260,7 +260,7 @@ def main():
     base_model = prepare_model_for_kbit_training(base_model)
     
     peft_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS, inference_mode=False, r=32, lora_alpha=200,
+        task_type=TaskType.TOKEN_CLS, inference_mode=False, r=8, lora_alpha=20,
         lora_dropout=0, target_modules=["query", "value", "key"], bias="none"
     )
     
