@@ -12,6 +12,7 @@ import random # Added for randomization
 
 # Assumed import for your attack function
 from subspace_attack import evaluate_subspace_attack 
+from intruder_attack import evaluate_intruder_attack 
 
 # Configuration
 MODEL_ID = "roberta-base"
@@ -329,6 +330,9 @@ def main():
 
     print("\n=== RUNNING OURS: SUBSPACE PROJECTION ATTACK ===")
     evaluate_subspace_attack(model, tokenizer, subset_in, subset_out, label_ids)
+
+    print("\n=== RUNNING OURS: intruder ATTACK ===")
+    evaluate_intruder_attack(model, tokenizer, subset_in, subset_out, label_ids)
 
 if __name__ == "__main__":
     main()
