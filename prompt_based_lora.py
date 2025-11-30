@@ -11,7 +11,6 @@ MODEL_ID = "roberta-base"
 SEED = 42
 set_seed(SEED)
 
-# Verbalizer words for AG News classes
 VERBALIZER_WORDS = ["World", "Sports", "Business", "Technology"]
 
 def get_data():
@@ -22,22 +21,17 @@ def get_data():
     return train_in, validation
 
 def preprocess_data(tokenizer):
-    # Get token IDs for verbalizers
     label_ids = [tokenizer.convert_tokens_to_ids(" " + w) for w in VERBALIZER_WORDS]
     mask_id = tokenizer.mask_token_id
     
     def preprocess(examples):
         inputs = []
-        
         for text in examples['text']:
-            # Create prompt - reduced text length for memory
             prompt = f"{text[:300]} Topic: {tokenizer.mask_token}"
             inputs.append(prompt)
             
-        # Tokenize with reduced max_length
         model_inputs = tokenizer(inputs, truncation=True, max_length=96, padding=False)
         
-        # Create labels (-100 everywhere except mask position)
         labels_list = []
         for i, (input_ids, label_idx) in enumerate(zip(model_inputs["input_ids"], examples['label'])):
             labels = [-100] * len(input_ids)
@@ -56,21 +50,16 @@ class DataCollatorForPromptMLM:
         self.tokenizer = tokenizer
 
     def __call__(self, features):
-        # Extract labels
         label_list = []
         for feature in features:
             labels = feature.pop("labels", None)
             if labels is not None:
-                if isinstance(labels, str):
-                    labels = eval(labels)
-                elif not isinstance(labels, list):
-                    labels = list(labels)
+                if isinstance(labels, str): labels = eval(labels)
+                elif not isinstance(labels, list): labels = list(labels)
                 label_list.append(labels)
         
-        # Pad inputs
         batch = self.tokenizer.pad(features, padding=True, return_tensors="pt")
         
-        # Pad labels
         if label_list:
             max_length = batch["input_ids"].shape[1]
             padded_labels = []
@@ -80,25 +69,23 @@ class DataCollatorForPromptMLM:
                 else:
                     padded = labels[:max_length]
                 padded_labels.append(padded)
-            
             batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
-        
         return batch
 
+# UPDATED: Handles filtered logits (only 4 columns)
 def compute_metrics(eval_pred, label_ids):
-    # Logits have been pre-filtered to shape [N, SeqLen, 4]
     logits, labels = eval_pred
     predictions = []
     references = []
     
     for i in range(len(logits)):
         mask_indices = np.where(labels[i] != -100)[0]
-        if len(mask_indices) == 0:
-            continue
+        if len(mask_indices) == 0: continue
             
         mask_idx = mask_indices[0]
         
-        # We take all columns because we already filtered for the 4 verbalizers
+        # Logits are already filtered to [4] columns.
+        # Index 0 = First Verbalizer, Index 1 = Second Verbalizer, etc.
         token_logits = logits[i, mask_idx, :] 
         predicted_idx = np.argmax(token_logits)
         
@@ -112,70 +99,43 @@ def compute_metrics(eval_pred, label_ids):
     return accuracy.compute(predictions=predictions, references=references)
 
 def main():
-    # Clear GPU cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         gc.collect()
     
-    # Load data
     train_in, validation = get_data()
-    
-    # Setup tokenizer and preprocessing
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
     preprocess, label_ids = preprocess_data(tokenizer)
     
-    print("\nVerbalizer Token IDs:")
-    for word, id in zip(VERBALIZER_WORDS, label_ids):
-        print(f"  {word}: {id}")
-    
-    # Tokenize datasets
     train_dataset = train_in.map(preprocess, batched=True, remove_columns=train_in.column_names)
     val_dataset = validation.map(preprocess, batched=True, remove_columns=validation.column_names)
     
-    # Set format to torch
     train_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
     val_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask', 'labels'])
     
-    # Load model with memory optimizations
     base_model = AutoModelForMaskedLM.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto"
     )
-    
-    # Enable gradient checkpointing for memory efficiency
     base_model.gradient_checkpointing_enable()
-    
-    # Prepare model for LoRA training with memory optimizations
     base_model = prepare_model_for_kbit_training(base_model)
     
-    # LoRA configuration
     peft_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS,
-        inference_mode=False,
-        r=4,
-        lora_alpha=16,
-        lora_dropout=0.1,
-        target_modules=["query", "value"],
-        bias="none"
+        task_type=TaskType.TOKEN_CLS, inference_mode=False, r=4, lora_alpha=16,
+        lora_dropout=0.1, target_modules=["query", "value"], bias="none"
     )
     
     model = get_peft_model(base_model, peft_config)
     model.print_trainable_parameters()
 
-    # --- NEW: Function to reduce logit size before caching ---
+    # --- CRITICAL FIX: Filter logits before storing ---
     def preprocess_logits_for_metrics(logits, labels):
-        """
-        Extracts only the logits for the verbalizer words to save memory.
-        Returns tensor of shape [Batch, Seq, 4] instead of [Batch, Seq, 50265]
-        """
-        if isinstance(logits, tuple):
-            logits = logits[1]
-        
-        # Select only the columns corresponding to our Verbalizer words
+        if isinstance(logits, tuple): logits = logits[1]
+        # Keep ONLY the columns for the verbalizer words
         return logits[:, :, label_ids]
-    
-    # Setup memory-efficient training arguments
+    # --------------------------------------------------
+
     training_args = TrainingArguments(
         output_dir="./lora-prompt",
         learning_rate=2e-4,
@@ -192,11 +152,6 @@ def main():
         fp16=torch.cuda.is_available(),
         optim="adamw_8bit" if torch.cuda.is_available() else "adamw",
         gradient_checkpointing=True,
-        max_grad_norm=1.0,
-        dataloader_pin_memory=False,
-        dataloader_num_workers=0,
-        # --- NEW: Aggressive offloading ---
-        eval_accumulation_steps=1, # Offload predictions to CPU immediately
     )
     
     trainer = Trainer(
@@ -207,49 +162,27 @@ def main():
         tokenizer=tokenizer,
         data_collator=DataCollatorForPromptMLM(tokenizer),
         compute_metrics=lambda x: compute_metrics(x, label_ids),
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics, # <--- REGISTER PREPROCESSOR
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics, # <--- Apply Fix
     )
     
-    # Evaluate before training
     print("\n=== BEFORE TRAINING ===")
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     train_metrics_before = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_before['eval_accuracy']:.4f}")
     
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     val_metrics_before = trainer.evaluate(eval_dataset=val_dataset)
     print(f"Validation Accuracy: {val_metrics_before['eval_accuracy']:.4f}")
     
-    # Clear cache before training
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    gc.collect()
-    
-    # Train
     print("\n=== TRAINING ===")
     trainer.train()
     
-    # Clear cache before evaluation
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    gc.collect()
-    
-    # Evaluate after training
     print("\n=== AFTER TRAINING ===")
     train_metrics_after = trainer.evaluate(eval_dataset=train_dataset)
     print(f"Train Accuracy: {train_metrics_after['eval_accuracy']:.4f}")
     
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     val_metrics_after = trainer.evaluate(eval_dataset=val_dataset)
     print(f"Validation Accuracy: {val_metrics_after['eval_accuracy']:.4f}")
     
-    # Save model
     trainer.save_model("./final-model")
-    print(f"\nTrain Improvement: {train_metrics_after['eval_accuracy'] - train_metrics_before['eval_accuracy']:.4f}")
-    print(f"Val Improvement: {val_metrics_after['eval_accuracy'] - val_metrics_before['eval_accuracy']:.4f}")
-    
-    # Print memory stats
-    if torch.cuda.is_available():
-        print(f"\nPeak GPU Memory: {torch.cuda.max_memory_allocated() / 1024**3:.2f} GB")
-        print(f"Current GPU Memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
 
 if __name__ == "__main__":
     main()
