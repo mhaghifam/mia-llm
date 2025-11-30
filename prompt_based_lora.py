@@ -198,6 +198,39 @@ def compute_metrics_prompt(eval_pred, label_ids, tokenizer):
     
     return result
 
+def evaluate_model(model, dataset, tokenizer, label_ids, batch_size=64, dataset_name="Dataset"):
+    """
+    Standalone evaluation function that can be called separately.
+    """
+    print(f"\n=== Evaluating on {dataset_name} ===")
+    
+    # Create a trainer just for evaluation
+    eval_args = TrainingArguments(
+        output_dir="./tmp_eval",
+        per_device_eval_batch_size=batch_size,
+        report_to="none",
+        remove_unused_columns=False,
+        fp16=torch.cuda.is_available(),
+    )
+    
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
+    
+    trainer = Trainer(
+        model=model,
+        args=eval_args,
+        tokenizer=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=lambda x: compute_metrics_prompt(x, label_ids, tokenizer)
+    )
+    
+    metrics = trainer.evaluate(eval_dataset=dataset)
+    
+    print(f"Accuracy: {metrics['eval_accuracy']:.4f}")
+    print(f"Samples evaluated: {metrics.get('eval_num_samples', 'N/A')}")
+    print(f"Errors encountered: {metrics.get('eval_num_errors', 0)}")
+    
+    return metrics
+
 def test_prompt_setup(tokenizer, label_ids, n_samples=5):
     """Test the prompt setup with a few examples."""
     print("\n=== Testing Prompt Setup ===")
@@ -227,7 +260,7 @@ def test_prompt_setup(tokenizer, label_ids, n_samples=5):
             print(f"\n✗ Failed - mask token not found in encoding")
 
 def train_prompt_lora():
-    """Main training function with all improvements."""
+    """Main training function without evaluation during training."""
     
     # 1. Load data
     train_in, train_out, train_aux, validation = get_splits(SEED)
@@ -254,6 +287,13 @@ def train_prompt_lora():
         desc="Tokenizing validation data"
     )
     
+    # Also tokenize train_out for later evaluation
+    tokenized_train_out = train_out.map(
+        preprocess_fn,
+        batched=True,
+        desc="Tokenizing train_out data"
+    )
+    
     # 5. Setup data collator
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer, padding=True)
 
@@ -261,14 +301,14 @@ def train_prompt_lora():
     print("\n=== Setting up model ===")
     base_model = AutoModelForMaskedLM.from_pretrained(MODEL_ID)
     
-    # LoRA configuration (using more appropriate task type)
+    # LoRA configuration
     peft_config = LoraConfig(
-        task_type=TaskType.TOKEN_CLS,  # More appropriate for token classification
+        task_type=TaskType.TOKEN_CLS,
         inference_mode=False,
         r=8,
         lora_alpha=32,
-        lora_dropout=0.1,  # Add dropout for better generalization
-        target_modules=["query", "value", "key"],  # Include key for better adaptation
+        lora_dropout=0.1,
+        target_modules=["query", "value", "key"],
         modules_to_save=None  # Keep MLM head frozen
     )
     
@@ -276,23 +316,18 @@ def train_prompt_lora():
     print("\nModel setup complete:")
     model.print_trainable_parameters()
 
-    # 7. Training arguments
+    # 7. Training arguments (simplified - no evaluation)
     training_args = TrainingArguments(
         output_dir="./roberta-prompt-lora-improved",
         learning_rate=1e-4,
         per_device_train_batch_size=32,
-        per_device_eval_batch_size=64,  # Larger batch for evaluation
         num_train_epochs=3,
         weight_decay=0.01,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
+        save_strategy="no",  # Don't save during training
         logging_steps=50,
         report_to="none",
         remove_unused_columns=False,  # Critical for custom labels
-        load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
-        greater_is_better=True,
-        warmup_ratio=0.1,  # Add warmup
+        warmup_ratio=0.1,
         fp16=torch.cuda.is_available(),  # Use mixed precision if available
     )
 
@@ -301,35 +336,70 @@ def train_prompt_lora():
         model=model,
         args=training_args,
         train_dataset=tokenized_train,
-        eval_dataset=tokenized_val,
         tokenizer=tokenizer,
         data_collator=data_collator,
-        compute_metrics=lambda x: compute_metrics_prompt(x, label_ids, tokenizer)
     )
 
-    # 9. Evaluate base model (zero-shot)
-    print("\n=== Evaluating Base Model (Zero-Shot) ===")
-    base_metrics = trainer.evaluate()
-    print(f"Zero-shot accuracy: {base_metrics['eval_accuracy']:.4f}")
-    print(f"Number of evaluated samples: {base_metrics.get('eval_num_samples', 'N/A')}")
+    # 9. Evaluate base model BEFORE training (zero-shot)
+    print("\n" + "="*50)
+    print("ZERO-SHOT EVALUATION (Before Training)")
+    print("="*50)
+    
+    base_metrics = {}
+    base_metrics['train_in'] = evaluate_model(model, tokenized_train, tokenizer, label_ids, dataset_name="Train_in (Zero-shot)")
+    base_metrics['train_out'] = evaluate_model(model, tokenized_train_out, tokenizer, label_ids, dataset_name="Train_out (Zero-shot)")
+    base_metrics['validation'] = evaluate_model(model, tokenized_val, tokenizer, label_ids, dataset_name="Validation (Zero-shot)")
 
     # 10. Train
-    print("\n=== Starting Training ===")
+    print("\n" + "="*50)
+    print("STARTING TRAINING")
+    print("="*50)
     train_result = trainer.train()
+    print(f"\nTraining completed. Loss: {train_result.training_loss:.4f}")
     
-    # 11. Evaluate fine-tuned model
-    print("\n=== Evaluating Fine-Tuned Model ===")
-    final_metrics = trainer.evaluate()
-    print(f"Fine-tuned accuracy: {final_metrics['eval_accuracy']:.4f}")
-    print(f"Improvement: {(final_metrics['eval_accuracy'] - base_metrics['eval_accuracy']):.4f}")
+    # 11. Evaluate fine-tuned model AFTER training
+    print("\n" + "="*50)
+    print("POST-TRAINING EVALUATION")
+    print("="*50)
     
-    # 12. Save the model
+    final_metrics = {}
+    final_metrics['train_in'] = evaluate_model(model, tokenized_train, tokenizer, label_ids, dataset_name="Train_in (Fine-tuned)")
+    final_metrics['train_out'] = evaluate_model(model, tokenized_train_out, tokenizer, label_ids, dataset_name="Train_out (Fine-tuned)")
+    final_metrics['validation'] = evaluate_model(model, tokenized_val, tokenizer, label_ids, dataset_name="Validation (Fine-tuned)")
+    
+    # 12. Print comparison
+    print("\n" + "="*50)
+    print("RESULTS SUMMARY")
+    print("="*50)
+    
+    for dataset in ['train_in', 'train_out', 'validation']:
+        before = base_metrics[dataset]['eval_accuracy']
+        after = final_metrics[dataset]['eval_accuracy']
+        improvement = after - before
+        print(f"{dataset:12} | Before: {before:.4f} | After: {after:.4f} | Δ: {improvement:+.4f}")
+    
+    # 13. Save the model
     trainer.save_model("./roberta-prompt-lora-final")
     print("\n✓ Model saved to ./roberta-prompt-lora-final")
     
-    return model, trainer, final_metrics
+    return model, trainer, base_metrics, final_metrics
 
 if __name__ == "__main__":
-    model, trainer, metrics = train_prompt_lora()
-    print("\n=== Training Complete ===")
-    print(f"Final validation accuracy: {metrics['eval_accuracy']:.4f}")
+    model, trainer, base_metrics, final_metrics = train_prompt_lora()
+    
+    print("\n=== Training and Evaluation Complete ===")
+    
+    # Print membership inference attack relevant metrics
+    print("\n=== MIA-Relevant Metrics ===")
+    train_in_acc = final_metrics['train_in']['eval_accuracy']
+    train_out_acc = final_metrics['train_out']['eval_accuracy']
+    gap = train_in_acc - train_out_acc
+    
+    print(f"Train_in accuracy:  {train_in_acc:.4f}")
+    print(f"Train_out accuracy: {train_out_acc:.4f}")
+    print(f"Memorization gap:   {gap:.4f}")
+    
+    if gap > 0.05:
+        print("⚠ Significant memorization detected (gap > 0.05)")
+    else:
+        print("✓ Low memorization (gap ≤ 0.05)")
