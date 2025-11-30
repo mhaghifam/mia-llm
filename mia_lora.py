@@ -28,9 +28,6 @@ def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
 
 # -----------------------
 # 1. Split function
@@ -47,7 +44,7 @@ def prepare_glue_splits(
     Load a GLUE task and split the *train* split into:
       - train_in  (members, used for fine-tuning)
       - train_out (non-members, used for MIA evaluation)
-      - train_aux (aux pool, e.g., to estimate curvature later)
+      - train_aux (aux pool, e.g., to train a bunch of shaddow model)
 
     Returns:
       train_in, train_out, train_aux, val_ds
@@ -336,50 +333,50 @@ if __name__ == "__main__":
 
 
 
-    # --- Your approach starts here ---
+    # # --- Your approach starts here ---
 
-    # 1) LoRA-only deltas
-    delta_params_lora, lora_names = get_lora_deltas(
-        train_result["model_ft"],
-        train_result["model_pt"],
-    )
+    # # 1) LoRA-only deltas
+    # delta_params_lora, lora_names = get_lora_deltas(
+    #     train_result["model_ft"],
+    #     train_result["model_pt"],
+    # )
 
-    # 2) A^{-1} delta in LoRA space from aux set
-    delta_tilde_vec = compute_Ainv_delta_lora(
-        model_pt=train_result["model_pt"],
-        tokenizer=train_result["tokenizer"],
-        train_aux_tok=train_result["train_aux_tok"],
-        lora_names=lora_names,
-        delta_params=delta_params_lora,
-        lambda_reg=1e-3,
-        max_aux_examples=600,  # you can tune this
-    )
+    # # 2) A^{-1} delta in LoRA space from aux set
+    # delta_tilde_vec = compute_Ainv_delta_lora(
+    #     model_pt=train_result["model_pt"],
+    #     tokenizer=train_result["tokenizer"],
+    #     train_aux_tok=train_result["train_aux_tok"],
+    #     lora_names=lora_names,
+    #     delta_params=delta_params_lora,
+    #     lambda_reg=1e-3,
+    #     max_aux_examples=600,  # you can tune this
+    # )
 
-    # 3) Unflatten to LoRA-shaped tensors
-    delta_tilde_params = unflatten_delta_tilde(
-        delta_tilde_vec,
-        lora_names,
-        delta_params_lora,
-    )
+    # # 3) Unflatten to LoRA-shaped tensors
+    # delta_tilde_params = unflatten_delta_tilde(
+    #     delta_tilde_vec,
+    #     lora_names,
+    #     delta_params_lora,
+    # )
 
-    # 4) Optionally subsample attack sets to cut per-sample gradients
-    def subsample(ds, k):
-        if k is None or k >= len(ds):
-            return ds
-        idx = list(range(len(ds)))
-        random.shuffle(idx)
-        return ds.select(idx[:k])
+    # # 4) Optionally subsample attack sets to cut per-sample gradients
+    # def subsample(ds, k):
+    #     if k is None or k >= len(ds):
+    #         return ds
+    #     idx = list(range(len(ds)))
+    #     random.shuffle(idx)
+    #     return ds.select(idx[:k])
 
-    max_attack_examples = 500  # adjust as needed
-    attack_in = subsample(train_result["train_in_tok"], max_attack_examples)
-    attack_out = subsample(train_result["train_out_tok"], max_attack_examples)
+    # max_attack_examples = 500  # adjust as needed
+    # attack_in = subsample(train_result["train_in_tok"], max_attack_examples)
+    # attack_out = subsample(train_result["train_out_tok"], max_attack_examples)
 
-    # 5) Curvature-aware MIA (LoRA-only)
-    mia_curv_lora = mia_curvature_attack_lora(
-        model_pt=train_result["model_pt"],
-        tokenizer=train_result["tokenizer"],
-        lora_names=lora_names,
-        delta_tilde_params=delta_tilde_params,
-        dataset_in_tok=attack_in,
-        dataset_out_tok=attack_out,
-    )
+    # # 5) Curvature-aware MIA (LoRA-only)
+    # mia_curv_lora = mia_curvature_attack_lora(
+    #     model_pt=train_result["model_pt"],
+    #     tokenizer=train_result["tokenizer"],
+    #     lora_names=lora_names,
+    #     delta_tilde_params=delta_tilde_params,
+    #     dataset_in_tok=attack_in,
+    #     dataset_out_tok=attack_out,
+    # )
