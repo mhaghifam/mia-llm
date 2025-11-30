@@ -189,6 +189,10 @@ def evaluate_subspace_attack(model_ft, tokenizer, train_in, validation, label_id
     
     print("\n[Attack] Scoring Non-Members...")
     scores_out = score_dataset(validation, "Non-Members")
+
+    print("\n--- DIAGNOSTICS ---")
+    print(f"Members:     Mean={np.mean(scores_in):.6e}, Std={np.std(scores_in):.6e}")
+    print(f"Non-Members: Mean={np.mean(scores_out):.6e}, Std={np.std(scores_out):.6e}")
     
     # 4. Calculate Metrics
     y_true = [1] * len(scores_in) + [0] * len(scores_out)
