@@ -8,7 +8,7 @@ import gc
 import torch.nn.functional as F
 from tqdm import tqdm
 from sklearn.metrics import roc_curve, auc
-from subspace_attack import run_subspace_attack
+from subspace_attack import evaluate_subspace_attack
 
 # Configuration
 MODEL_ID = "roberta-base"
@@ -342,7 +342,7 @@ def main():
     # Note: You might need to pass MODEL_ID if it's not defined in attack.py, 
     # or ensure attack.py has a default. 
     # The function signature I gave you uses "roberta-base" by default.
-    run_subspace_attack(model, tokenizer, subset_in, subset_out, label_ids)
+    evaluate_subspace_attack(model, tokenizer, subset_in, subset_out, label_ids)
 
 if __name__ == "__main__":
     main()
