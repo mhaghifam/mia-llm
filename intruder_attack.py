@@ -17,41 +17,31 @@ class SpectralIntruderAttack:
         """
         self.base_model = base_model
         self.model_ft = lora_model
-        # Align intruder tensors with the fine-tuned model device (inputs/gradients live here)
         self.device = next(lora_model.parameters()).device
         self.intruder_subspaces = {} 
         self.target_layer_indices = []
         
-        # Ensure base model is in eval mode for consistent stats
         self.base_model.eval()
         
         print(f"Initializing Intruder Attack (Threshold < {threshold})...")
         
-        # 1. Robustly Identify Encoder
-        # PEFT wraps the base model in .base_model. 
-        # RoBERTa keeps encoder in .roberta.encoder
         if hasattr(lora_model.base_model, "roberta"):
             self.ft_encoder = lora_model.base_model.roberta.encoder
             self.base_encoder = base_model.roberta.encoder
         elif hasattr(lora_model.base_model, "model"):
-             # Fallback for some wrappers
             self.ft_encoder = lora_model.base_model.model.encoder
             self.base_encoder = base_model.model.encoder
         else:
-            # Fallback for generic HF
             self.ft_encoder = lora_model.base_model.encoder
             self.base_encoder = base_model.encoder
             
         num_layers = len(self.ft_encoder.layer)
 
-        # 2. Extract Intruders per Layer
         for i in tqdm(range(num_layers), desc="Spectral Analysis"):
             try:
-                # Access LoRA Layers
                 peft_layer_q = self.ft_encoder.layer[i].attention.self.query
                 peft_layer_v = self.ft_encoder.layer[i].attention.self.value
                 
-                # Access Base Layers (frozen)
                 W0_q = self.base_encoder.layer[i].attention.self.query.weight.detach()
                 W0_v = self.base_encoder.layer[i].attention.self.value.weight.detach()
             except AttributeError:
@@ -60,16 +50,14 @@ class SpectralIntruderAttack:
             if hasattr(peft_layer_q, "lora_A"):
                 self.target_layer_indices.append(i)
                 
-                # Find Intruders (Compute on CPU to save GPU RAM)
                 intruders_q = self._find_intruders(peft_layer_q, W0_q, threshold, top_k_base)
                 intruders_v = self._find_intruders(peft_layer_v, W0_v, threshold, top_k_base)
                 
                 self.intruder_subspaces[i] = {
-                    'q': intruders_q, # Kept on GPU for attack speed
+                    'q': intruders_q,
                     'v': intruders_v
                 }
         
-        # Filter active layers
         self.active_layers = [i for i in self.target_layer_indices 
                               if self.intruder_subspaces[i]['q'] is not None 
                               or self.intruder_subspaces[i]['v'] is not None]
@@ -77,91 +65,71 @@ class SpectralIntruderAttack:
         print(f"Intruder Dimensions found in {len(self.active_layers)}/{num_layers} layers.")
 
     def _find_intruders(self, lora_layer, W_pre, threshold, top_k):
-        # 1. Construct W_FT = W_pre + B @ A
-        # Move to CPU for SVD stability and memory saving
+        """Return intruder directions in the LoRA-updated weight matrix."""
         A = lora_layer.lora_A.default.weight.detach().cpu().float()
         B = lora_layer.lora_B.default.weight.detach().cpu().float()
         W_pre = W_pre.cpu().float()
         
         W_FT = W_pre + torch.matmul(B, A)
         
-        # 2. SVD of W_pre (Reference)
         try:
             U_pre, _, _ = torch.linalg.svd(W_pre, full_matrices=False)
         except RuntimeError: return None
         
-        # Safety clamp for top_k
         valid_k = min(top_k, U_pre.shape[1])
         U_safe = U_pre[:, :valid_k]
         
-        # 3. SVD of W_FT (Target)
         try:
             U_ft, _, _ = torch.linalg.svd(W_FT, full_matrices=False)
         except RuntimeError: return None
         
-        # Check top 64 directions of FT model
         check_depth = min(64, U_ft.shape[1])
         U_ft_check = U_ft[:, :check_depth]
         
         intruders = []
         
-        # 4. Filter Loop
         for j in range(U_ft_check.shape[1]):
             u_vec = U_ft_check[:, j]
             
-            # Project onto Safe Subspace
             projection = torch.matmul(U_safe.T, u_vec)
             alignment = torch.norm(projection)
             
-            # Strict Orthogonality Check
             if alignment < threshold:
                 intruders.append(u_vec)
         
         if not intruders:
             return None
             
-        # Move result back to the FT model device for the attack phase
         return torch.stack(intruders, dim=1).to(self.device)
 
     def compute_score(self, input_ids, mask_idx, target_token_id):
-        # If no intruder dimensions were found, fall back to 0
+        """Compute an intruder projection score for one example."""
         if not self.active_layers:
             return 0.0
 
-        # 1. Force Gradients on Frozen Weights
-        # LoRA freezes base weights, so autograd usually ignores them.
-        # We must manually set requires_grad=True for this pass.
         target_params = []
         
         for i in self.active_layers:
-            # Use the robust encoder reference we found in __init__
             layer = self.ft_encoder.layer[i].attention.self
             
-            # [CRITICAL FIX] Force gradients on frozen parameters
             layer.query.weight.requires_grad_(True)
             layer.value.weight.requires_grad_(True)
             
             target_params.append(layer.query.weight)
             target_params.append(layer.value.weight)
 
-        # No parameters collected: return neutral score
         if not target_params:
             return 0.0
             
-        # 2. Forward Pass with Gradients Enabled
-        # Even if in eval mode, we need gradient tracking
         with torch.enable_grad():
             outputs = self.model_ft(input_ids=input_ids)
             target_logit = outputs.logits[0, mask_idx, target_token_id]
             
-            # 3. Compute Gradients
             grads = torch.autograd.grad(target_logit, target_params, retain_graph=False, create_graph=False)
         
-        # Cleanup: Reset requires_grad to False to respect frozen state
         for p in target_params:
             p.requires_grad_(False)
 
-        # 4. Project onto Intruders
         total_score = 0.0
         grad_iter = iter(grads)
         valid_counts = 0
@@ -173,7 +141,6 @@ class SpectralIntruderAttack:
             def score(grad, Q_int):
                 if Q_int is None: return 0.0
                 proj = torch.matmul(Q_int.T, grad)
-                # Normalized Energy
                 return torch.norm(proj) / (torch.norm(grad) + 1e-9)
 
             s_q = score(grad_q, self.intruder_subspaces[i]['q'])
@@ -190,7 +157,7 @@ class SpectralIntruderAttack:
         return (total_score / valid_counts).item()
 
 def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_ids, threshold=0.1, top_k_base=64):
-    # Use the fine-tuned model device for scoring; keep base on CPU for SVD
+    """Evaluate the intruder attack and return ROC-AUC."""
     device = next(model_ft.parameters()).device
     
     print("\n[Attack] Loading Base Model for Spectral Comparison...")
@@ -202,6 +169,7 @@ def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_id
     mask_token_id = tokenizer.mask_token_id
     
     def score_dataset(dataset, desc, attacker_obj):
+        """Score a dataset with the intruder attack."""
         scores = []
         for i in tqdm(range(len(dataset)), desc=desc):
             sample = dataset[i]
@@ -218,10 +186,8 @@ def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_id
             
             mask_idx = mask_pos.item()
             
-            # Zero gradients before computing new ones
             model_ft.zero_grad()
             
-            # Attack Score
             score = attacker_obj.compute_score(input_ids, mask_idx, target_id)
             scores.append(score)
         return np.array(scores)
@@ -241,7 +207,6 @@ def evaluate_intruder_attack(model_ft, tokenizer, train_in, validation, label_id
     
     print(f"\n>>> INTRUDER ATTACK (T={threshold}) AUC: {roc_auc:.4f} <<<")
     
-    # Cleanup
     del base_model
     del attacker
     torch.cuda.empty_cache()

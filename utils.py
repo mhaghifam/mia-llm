@@ -23,17 +23,11 @@ def prepare_glue_splits(
     seed: int = 42,
 ):
     """
-    Load a GLUE task and split the *train* split into:
-      - train_in  (members, used for fine-tuning)
-      - train_out (non-members, used for MIA evaluation)
-      - train_aux (aux pool, e.g., to train a bunch of shaddow model)
+    Load a GLUE task and split the train split into train_in, train_out, train_aux.
 
     Returns:
       train_in, train_out, train_aux, val_ds
-    (all are HuggingFace Dataset objects, not tokenized yet)
     """
-    # assert abs(frac_in + frac_out + frac_aux - 1.0) < 1e-6, "fractions must sum to 1"
-
     raw_datasets = load_dataset("glue", task_name)
     full_train = raw_datasets["train"].shuffle(seed=seed)
     val_ds = raw_datasets["validation"]

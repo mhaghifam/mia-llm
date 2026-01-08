@@ -1,11 +1,8 @@
-# pip install -U transformers datasets peft evaluate accelerate
-
 import random
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from datasets import load_dataset
 import evaluate
 
 from transformers import (
@@ -17,27 +14,16 @@ from transformers import (
 )
 
 from peft import LoraConfig, TaskType, get_peft_model
-from cur_attack import get_lora_deltas, compute_Ainv_delta_lora,unflatten_delta_tilde, mia_curvature_attack_lora
+from cur_attack import get_lora_deltas, compute_Ainv_delta_lora, unflatten_delta_tilde, mia_curvature_attack_lora
+from utils import prepare_glue_splits
 
-
-# -----------------------
-# 0. Reproducibility
-# -----------------------
 
 def set_seed(seed: int = 42):
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-# -----------------------
-# 1. Split function
-# -----------------------
-
-
-
-# -----------------------
-# 2. Training function
-# -----------------------
 
 def train_lora_roberta(
     train_in,
@@ -61,14 +47,13 @@ def train_lora_roberta(
       - tokenizer
       - train_in_tok, train_out_tok, train_aux_tok, val_tok
     """
-
     set_seed(seed)
 
-    # --- tokenizer & preprocessing ---
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     base_columns = train_in.column_names
 
     def preprocess(batch):
+        """Tokenize inputs and attach labels."""
         enc = tokenizer(
             batch["sentence"],
             truncation=True,
@@ -85,15 +70,14 @@ def train_lora_roberta(
 
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
-    # --- metric ---
     accuracy = evaluate.load("accuracy")
 
     def compute_metrics(eval_pred):
+        """Compute accuracy from logits and labels."""
         logits, labels = eval_pred
         preds = np.argmax(logits, axis=-1)
         return accuracy.compute(predictions=preds, references=labels)
 
-    # --- base model + LoRA ---
     base_model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=2,
@@ -111,22 +95,16 @@ def train_lora_roberta(
     model_ft = get_peft_model(base_model, lora_config)
     model_ft.print_trainable_parameters()
 
-    # Save initial (PT) LoRA state
-    pt_lora_state = {
-        name: p.detach().clone()
-        for name, p in model_ft.named_parameters()
-        if "lora_" in name
-    }
+    pt_lora_state = {name: p.detach().clone() for name, p in model_ft.named_parameters() if "lora_" in name}
 
-    # --- Trainer ---
     training_args = TrainingArguments(
-    output_dir="./roberta_cola_lora_mia",
-    per_device_train_batch_size=batch_size,
-    per_device_eval_batch_size=batch_size * 2,
-    learning_rate=learning_rate,
-    num_train_epochs=num_train_epochs,
-    weight_decay=weight_decay,
-    logging_steps=50,
+        output_dir="./roberta_cola_lora_mia",
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size * 2,
+        learning_rate=learning_rate,
+        num_train_epochs=num_train_epochs,
+        weight_decay=weight_decay,
+        logging_steps=50,
     )
 
     trainer = Trainer(
@@ -139,27 +117,18 @@ def train_lora_roberta(
         compute_metrics=compute_metrics,
     )
 
-    # --- BEFORE fine-tuning ---
     print("\n=== Evaluation BEFORE fine-tuning ===")
     pre_metrics = trainer.evaluate()
     print(pre_metrics)
 
-    # --- TRAIN ---
     trainer.train()
 
-    # --- AFTER fine-tuning ---
     print("\n=== Evaluation AFTER fine-tuning ===")
     post_metrics = trainer.evaluate()
     print(post_metrics)
 
-    # Save FT LoRA state
-    ft_lora_state = {
-        name: p.detach().clone()
-        for name, p in model_ft.named_parameters()
-        if "lora_" in name
-    }
+    ft_lora_state = {name: p.detach().clone() for name, p in model_ft.named_parameters() if "lora_" in name}
 
-    # Rebuild a clean PT model (same architecture + LoRA, with PT LoRA weights)
     base_model_pt = AutoModelForSequenceClassification.from_pretrained(
         model_name,
         num_labels=2,
@@ -182,10 +151,6 @@ def train_lora_roberta(
         "post_metrics": post_metrics,
     }
 
-
-# -----------------------
-# 3. Baseline MIA (log P_FT / P_PT)
-# -----------------------
 
 def baseline_mia_logratio(
     model_pt,
@@ -213,6 +178,7 @@ def baseline_mia_logratio(
     data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
     def compute_scores(dataset):
+        """Compute log-ratio scores over a dataset."""
         scores = []
         for start in range(0, len(dataset), batch_size):
             end = min(start + batch_size, len(dataset))
@@ -228,7 +194,6 @@ def baseline_mia_logratio(
                 log_probs_ft = F.log_softmax(out_ft.logits, dim=-1)
                 log_probs_pt = F.log_softmax(out_pt.logits, dim=-1)
 
-                # log P(y|x) for the true label
                 log_p_ft = log_probs_ft[torch.arange(labels.size(0)), labels]
                 log_p_pt = log_probs_pt[torch.arange(labels.size(0)), labels]
 
@@ -239,7 +204,7 @@ def baseline_mia_logratio(
     scores_out = compute_scores(dataset_out_tok)
     print("Mean log-ratio (IN) :", np.mean(scores_in), "Std:", np.std(scores_in))
     print("Mean log-ratio (OUT):", np.mean(scores_out), "Std:", np.std(scores_out))
-    # Build labels: 1 for members, 0 for non-members
+
     all_scores = np.array(scores_in + scores_out)
     all_labels = np.array([1] * len(scores_in) + [0] * len(scores_out))
 
@@ -257,14 +222,9 @@ def baseline_mia_logratio(
     }
 
 
-# -----------------------
-# Example usage
-# -----------------------
-
 if __name__ == "__main__":
     set_seed(42)
 
-    # 1) prepare splits
     train_in, train_out, train_aux, val_ds = prepare_glue_splits(
         task_name="cola",
         frac_in=0.4,
@@ -273,7 +233,6 @@ if __name__ == "__main__":
         seed=42,
     )
 
-    # 2) train LoRA model
     train_result = train_lora_roberta(
         train_in=train_in,
         train_out=train_out,
@@ -282,7 +241,6 @@ if __name__ == "__main__":
         model_name="roberta-base",
     )
 
-    # 3) run baseline MIA with log P_FT / P_PT
     mia_result = baseline_mia_logratio(
         model_pt=train_result["model_pt"],
         model_ft=train_result["model_ft"],
@@ -290,53 +248,3 @@ if __name__ == "__main__":
         dataset_in_tok=train_result["train_in_tok"],
         dataset_out_tok=train_result["train_out_tok"],
     )
-
-
-
-    # # --- Your approach starts here ---
-
-    # # 1) LoRA-only deltas
-    # delta_params_lora, lora_names = get_lora_deltas(
-    #     train_result["model_ft"],
-    #     train_result["model_pt"],
-    # )
-
-    # # 2) A^{-1} delta in LoRA space from aux set
-    # delta_tilde_vec = compute_Ainv_delta_lora(
-    #     model_pt=train_result["model_pt"],
-    #     tokenizer=train_result["tokenizer"],
-    #     train_aux_tok=train_result["train_aux_tok"],
-    #     lora_names=lora_names,
-    #     delta_params=delta_params_lora,
-    #     lambda_reg=1e-3,
-    #     max_aux_examples=600,  # you can tune this
-    # )
-
-    # # 3) Unflatten to LoRA-shaped tensors
-    # delta_tilde_params = unflatten_delta_tilde(
-    #     delta_tilde_vec,
-    #     lora_names,
-    #     delta_params_lora,
-    # )
-
-    # # 4) Optionally subsample attack sets to cut per-sample gradients
-    # def subsample(ds, k):
-    #     if k is None or k >= len(ds):
-    #         return ds
-    #     idx = list(range(len(ds)))
-    #     random.shuffle(idx)
-    #     return ds.select(idx[:k])
-
-    # max_attack_examples = 500  # adjust as needed
-    # attack_in = subsample(train_result["train_in_tok"], max_attack_examples)
-    # attack_out = subsample(train_result["train_out_tok"], max_attack_examples)
-
-    # # 5) Curvature-aware MIA (LoRA-only)
-    # mia_curv_lora = mia_curvature_attack_lora(
-    #     model_pt=train_result["model_pt"],
-    #     tokenizer=train_result["tokenizer"],
-    #     lora_names=lora_names,
-    #     delta_tilde_params=delta_tilde_params,
-    #     dataset_in_tok=attack_in,
-    #     dataset_out_tok=attack_out,
-    # )
