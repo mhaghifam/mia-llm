@@ -2,11 +2,6 @@ This repo explores white-box membership inference attacks on LoRA-finetuned mode
 
 Our goal is to go beyond scalar loss and exploit the geometry of the LoRA update itself and design white-box attacks. This repository contains code and experiments for testing these attacks against the baseline on simple setups (e.g., RoBERTa + LoRA on SST-2).
 
-## Context
-
-- Threat model: white-box MIA with access to model weights and gradients.
-- Focus: signals in the LoRA update $W_{\text{FT}} = W_0 + BA$ instead of only scalar loss.
-- Example setups: prompt-based MLM on AG News (`prompt_based_lora.py`) and sequence classification on GLUE CoLA (`mia_lora.py`).
 
 
 ## Attacks
